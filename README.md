@@ -1,5 +1,7 @@
 # C++ High-Performance Network Interceptor & Lua Scripting Proxy
 
+[![Discord](https://img.shields.io/badge/Discord-Join%20Community-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/XcMrhfwuMf)
+
 A modular, multi-threaded C++ network interception proxy and scripting sandbox. The application intercepts local game client connection requests via transparent SSL/DNS redirection, intercepts raw network packets, and exposes system hooks to an embedded **LuaJIT** scripting engine.
 
 ---
