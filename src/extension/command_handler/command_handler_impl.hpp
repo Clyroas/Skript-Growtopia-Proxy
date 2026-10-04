@@ -819,6 +819,10 @@ private:
                 tank = reinterpret_cast<const packet::TankUpdatePacket*>(&game_packet);
             }
             client::Client* client = core_->get_client();
+            if (client && command::TeleportCommand::handle_autopath_click(client, tank->int_x, tank->int_y)) {
+                const_cast<core::EventPacket&>(event).canceled = true;
+                return;
+            }
             if (client && command::FindPathCommand::handle_shift_click(client, tank->int_x, tank->int_y)) {
                 const_cast<core::EventPacket&>(event).canceled = true;
                 return;

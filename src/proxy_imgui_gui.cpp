@@ -336,60 +336,16 @@ static void UpdateDoorIdOverlay() {
 // ---------------------------------------------------------------------------
 // Mouse-aimed autopath
 //
-// Press the configured key and the player walks to the tile under the mouse
-// cursor over the Growtopia window; if no walkable path exists, the "auto"
-// mode falls back to a direct teleport ("walk"/"teleport" force one behavior).
-// The screen->tile mapping inverts the door overlay's camera model:
-//   screen = center + (tile + 0.5 - camera) * 32, camera = clamped player tile.
+// Primary interaction (exact): hold the configured key and CLICK a tile - the
+// game client itself resolves the click to a tile and reports it in the
+// activate/change packet, which the proxy consumes and turns into the move.
+// No camera math is involved, so the destination is exactly where you clicked.
+//
+// Hover fallback (approximate): with command.autopath.trigger = "hover",
+// pressing the key moves to the tile under the mouse arrow, using the same
+// camera model as the door overlay. Growtopia's camera leans toward the mouse
+// and smooths its motion, so hover targeting can be off by a tile or two.
 // ---------------------------------------------------------------------------
-
-static std::atomic<bool> g_autopath_running{ false };
-
-static void RunAutoPathTo(core::Core* core, uint32_t tile_x, uint32_t tile_y) {
-    // One action at a time: the walk variant blocks its worker for seconds, and
-    // keypress spam must not stack overlapping pathfinders (packet storms).
-    if (g_autopath_running.exchange(true)) {
-        return;
-    }
-
-    std::thread([core, tile_x, tile_y]() {
-        auto* client = core ? core->get_client() : nullptr;
-        auto* server = core ? core->get_server() : nullptr;
-        player::Player* local = server ? server->get_player() : nullptr;
-        if (!client || !local) {
-            g_autopath_running = false;
-            return;
-        }
-
-        std::string mode = "auto";
-        try {
-            mode = core->get_config().get<std::string>("command.autopath.mode", std::string("auto"));
-        } catch (...) {}
-        std::transform(mode.begin(), mode.end(), mode.begin(),
-            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-
-        auto chat = [local](const std::string& msg) {
-            utils::PacketUtils::send_chat_message(local, msg);
-        };
-
-        if (mode == "teleport") {
-            if (command::TeleportCommand::send_teleport_to(client, tile_x, tile_y)) {
-                chat(fmt::format("`9Autopath: teleported to `w({}, {})`9.", tile_x, tile_y));
-            }
-        } else {
-            const int steps = command::FindPathCommand::run_path(client, tile_x, tile_y, false);
-            if (steps > 0) {
-                chat(fmt::format("`2Autopath: walked {} step(s) to `w({}, {})`2.", steps, tile_x, tile_y));
-            } else if (mode == "walk") {
-                chat(fmt::format("`4Autopath: no walkable path to `w({}, {})`4.", tile_x, tile_y));
-            } else if (command::TeleportCommand::send_teleport_to(client, tile_x, tile_y)) {
-                chat(fmt::format("`9Autopath: no walkable path to `w({}, {})`9 - teleported instead.", tile_x, tile_y));
-            }
-        }
-
-        g_autopath_running = false;
-    }).detach();
-}
 
 static void UpdateAutoPathKeybind() {
     static bool prev_down = false;
@@ -402,11 +358,13 @@ static void UpdateAutoPathKeybind() {
 
     bool enabled = true;
     int key = 45;  // VK_INSERT
+    std::string trigger = "click";
     try {
         enabled = core->get_config().get<bool>("command.autopath.enabled", true);
         key = core->get_config().get<int>("command.autopath.key", 45);
+        trigger = core->get_config().get<std::string>("command.autopath.trigger", std::string("click"));
     } catch (...) {}
-    if (!enabled || key <= 0) {
+    if (!enabled || key <= 0 || trigger != "hover") {
         prev_down = false;
         return;
     }
@@ -467,7 +425,8 @@ static void UpdateAutoPathKeybind() {
         return;
     }
 
-    RunAutoPathTo(core, static_cast<uint32_t>(tile_x), static_cast<uint32_t>(tile_y));
+    command::TeleportCommand::run_autopath_action(
+        static_cast<uint32_t>(tile_x), static_cast<uint32_t>(tile_y));
 }
 
 
@@ -1143,19 +1102,24 @@ static void TabWorld() {
         bool autopath_enabled = true;
         int autopath_key = 45;
         std::string autopath_mode = "auto";
+        std::string autopath_trigger = "click";
         try {
             autopath_enabled = gui_core->get_config().get<bool>("command.autopath.enabled", true);
             autopath_key = gui_core->get_config().get<int>("command.autopath.key", 45);
             autopath_mode = gui_core->get_config().get<std::string>("command.autopath.mode", std::string("auto"));
+            autopath_trigger = gui_core->get_config().get<std::string>("command.autopath.trigger", std::string("click"));
         } catch (...) {}
 
-        if (ImGui::Checkbox("Mouse autopath (walk to cursor tile, teleport if blocked)", &autopath_enabled)) {
+        if (ImGui::Checkbox("Mouse autopath: hold key + click a tile (walk, teleport if blocked)", &autopath_enabled)) {
             gui_core->get_config().set<bool>("command.autopath.enabled", autopath_enabled);
             AppendLog(std::string("[GUI] Mouse autopath ") + (autopath_enabled ? "ENABLED" : "DISABLED"));
         }
         ImGui::SameLine();
-        ImGui::TextDisabled("key: 0x%02X, mode: %s", autopath_key, autopath_mode.c_str());
-        ImGui::TextDisabled("Set command.autopath.key / .mode in config.json (45 = Insert).");
+        ImGui::TextDisabled("key: 0x%02X, mode: %s, trigger: %s", autopath_key, autopath_mode.c_str(), autopath_trigger.c_str());
+        ImGui::TextDisabled("Hold the key and click a tile for exact targeting. trigger=hover in config.json uses the approximate mouse-hover mode.");
+        if (autopath_enabled) {
+            ImGui::TextDisabled("While the key is held, your clicks are consumed by autopath (no punching).");
+        }
     }
 
     

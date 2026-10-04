@@ -104,6 +104,15 @@ public:
     // Shared with ScanPathCommand's teleport traversal.
     static bool send_teleport_to(client::Client* client, uint32_t tile_x, uint32_t tile_y);
 
+    // Hold-the-autopath-key + click: the game client reports the clicked tile in
+    // the activate/change packet (exact, camera-independent). Returns true when
+    // the click was consumed so the caller cancels the punch/place packet.
+    static bool handle_autopath_click(client::Client* client, uint32_t tile_x, uint32_t tile_y);
+
+    // Executes the configured walk/teleport action for one target tile. Shared by
+    // the click handler and the GUI hover keybind; one action runs at a time.
+    static void run_autopath_action(uint32_t tile_x, uint32_t tile_y);
+
 private:
     static core::Core* s_core;
 };

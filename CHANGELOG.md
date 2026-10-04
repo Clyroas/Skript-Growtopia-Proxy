@@ -1,5 +1,29 @@
 # Changelog
 
+## [2.4.1] — Autopath now targets exactly what you click
+
+Hover-based targeting was inaccurate: Growtopia's camera leans toward the mouse
+and smooths its motion, so no player-centered camera model can reliably map the
+cursor to a tile - the selected path landed next to what was pointed at.
+
+### Changed — hold key + click is the primary (exact) interaction
+
+With `command.autopath.trigger = "click"` (the default), **hold the autopath key
+and click a tile**: the game client itself resolves the click to a tile and
+reports it in the tile activate/change packet (`int_x`/`int_y`), which the proxy
+consumes and turns into the move. The camera never lies here - the destination
+is exactly the tile the game says you clicked, whatever the zoom or camera lean.
+The consumed click does not punch or place (the packet is canceled).
+
+The action executor is shared by both triggers and serialized (one move at a
+time). `walk` / `teleport` / `auto` modes behave as before.
+
+### Kept — hover mode as an approximate fallback
+
+Setting `command.autopath.trigger = "hover"` restores the previous press-key-
+while-hovering behavior; it uses the same camera model as the door overlay and
+can still be off by a tile or two because of the camera lean.
+
 ## [2.4.0] — Mouse-aimed autopath keybind
 
 Point the mouse anywhere in the Growtopia window and press **Insert**: the player

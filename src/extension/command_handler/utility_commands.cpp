@@ -751,6 +751,90 @@ void TeleportCommand::execute(client::Client* client, const std::vector<std::str
         fmt::format("`9Teleported to tile `w({}, {})`9.", tile_x, tile_y));
 }
 
+namespace {
+std::atomic<bool> g_autopath_running{ false };
+}
+
+void TeleportCommand::run_autopath_action(uint32_t tile_x, uint32_t tile_y) {
+    if (!s_core) return;
+
+    // One action at a time: walk mode blocks its worker for seconds and keypress
+    // or click spam must not stack overlapping pathfinders (packet storms).
+    if (g_autopath_running.exchange(true)) {
+        return;
+    }
+
+    std::thread([core = s_core, tile_x, tile_y]() {
+        auto* client = core->get_client();
+        auto* server = core->get_server();
+        player::Player* local = server ? server->get_player() : nullptr;
+        if (!client || !local) {
+            g_autopath_running = false;
+            return;
+        }
+
+        std::string mode = "auto";
+        try {
+            mode = core->get_config().get<std::string>("command.autopath.mode", std::string("auto"));
+        } catch (...) {}
+        std::transform(mode.begin(), mode.end(), mode.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+        auto chat = [local](const std::string& msg) {
+            utils::PacketUtils::send_chat_message(local, msg);
+        };
+
+        if (mode == "teleport") {
+            if (TeleportCommand::send_teleport_to(client, tile_x, tile_y)) {
+                chat(fmt::format("`9Autopath: teleported to `w({}, {})`9.", tile_x, tile_y));
+            }
+        } else {
+            const int steps = FindPathCommand::run_path(client, tile_x, tile_y, false);
+            if (steps > 0) {
+                chat(fmt::format("`2Autopath: walked {} step(s) to `w({}, {})`2.", steps, tile_x, tile_y));
+            } else if (mode == "walk") {
+                chat(fmt::format("`4Autopath: no walkable path to `w({}, {})`4.", tile_x, tile_y));
+            } else if (TeleportCommand::send_teleport_to(client, tile_x, tile_y)) {
+                chat(fmt::format("`9Autopath: no walkable path to `w({}, {})`9 - teleported instead.", tile_x, tile_y));
+            }
+        }
+
+        g_autopath_running = false;
+    }).detach();
+}
+
+bool TeleportCommand::handle_autopath_click(client::Client* client, uint32_t tile_x, uint32_t tile_y) {
+#ifdef _WIN32
+    bool enabled = true;
+    int key = 45;  // VK_INSERT
+    std::string trigger = "click";
+    try {
+        enabled = s_core->get_config().get<bool>("command.autopath.enabled", true);
+        key = s_core->get_config().get<int>("command.autopath.key", 45);
+        trigger = s_core->get_config().get<std::string>("command.autopath.trigger", std::string("click"));
+    } catch (...) {}
+
+    if (!s_core || !enabled || trigger != "click" || key <= 0) {
+        return false;
+    }
+
+    const bool key_down = (GetAsyncKeyState(key) & 0x8000) != 0;
+    if (!key_down) {
+        return false;
+    }
+
+    // The game client already resolved the click to this exact tile. Consume the
+    // punch/place packet and move instead.
+    run_autopath_action(tile_x, tile_y);
+    return true;
+#else
+    (void)client;
+    (void)tile_x;
+    (void)tile_y;
+    return false;
+#endif
+}
+
 
 FlagCommand::FlagCommand() : CommandBase(
     {"flag", "country"},
