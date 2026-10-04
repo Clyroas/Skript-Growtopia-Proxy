@@ -1,5 +1,36 @@
 # Changelog
 
+## [2.3.1] — Session-kill fixes: reconnects no longer destroy the live session
+
+The proxy's own reconnect machinery was killing healthy sessions, which looked to the
+player like "the last feature I used caused a random disconnect". Three defects, all
+visible in the run logs (`peer slots in use`, superseded peers saying goodbye after
+their session had already been replaced, and login packets dropped during every
+reconnect):
+
+### Fixed — a stale peer's goodbye tore down the live session
+
+Both hosts allow overlapping peers (8 slots), but neither `Client::on_disconnect` nor
+`Server::on_disconnect` checked *which* peer had disconnected. A DISCONNECT event for
+a stale peer — a superseded session, a rejected connection, or a timed-out connect
+attempt still occupying a slot — destroyed the **current** `player_`, sent the client
+an error, and disconnected both sides. Every fresh reconnect inherited whatever stale
+peers were still saying goodbye. Both handlers now ignore disconnect events for peers
+that are not the active session's peer, matching the identity checks the receive
+paths already had.
+
+### Fixed — login packets dropped during the upstream handshake race
+
+The client starts sending its login the moment the proxy accepts it, but the upstream
+ENet handshake usually completes a few round-trips later. `Server::on_receive` waited
+only 50 ms for the upstream and then **dropped** the packet — often the login hello
+itself. The server saw an empty session, the client hung and gave up, and the retry
+loop restarted the cycle (visible in the log as `Real server still not connected,
+dropping packet` on every reconnect). Early packets are now queued (up to 32) and
+replayed in order by `Client::on_connect` once the upstream peer exists. Queued
+packets from a *previous* client session are purged on every new client connect, on
+disconnect, and in the destructor, so they can never leak into a fresh handshake.
+
 ## [2.3.0] — Teleporter and dropped-item detection
 
 ### Added — teleporter

@@ -1,5 +1,7 @@
 #include "world_parser_v2.h"
 #include <spdlog/spdlog.h>
+#include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <iomanip>
 #include <sstream>

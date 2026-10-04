@@ -84,6 +84,7 @@ Server::Server(core::Core* core)
 
 Server::~Server()
 {
+    clear_pending();
     if (host_) {
         enet_host_destroy(host_);
     }
@@ -170,7 +171,11 @@ void Server::on_connect(ENetPeer* peer)
         delete player_;
         player_ = nullptr;
     }
-    
+
+    // Login packets queued by a previous client session belong to that dead session;
+    // replaying them into the fresh one would corrupt its handshake.
+    clear_pending();
+
     player_ = new player::Player{ peer };
 
     
@@ -210,25 +215,22 @@ void Server::on_receive(ENetPeer* peer, ENetPacket* packet)
     const player::Player* to_player = core_->get_client()->get_player();
     
     
-    if (!to_player) {
-        spdlog::warn("Real server client not ready yet, queuing packet...");
-        
-        
-        for (int i = 0; i < 5; i++) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            to_player = core_->get_client()->get_player();
-            if (to_player) {
-                spdlog::info("Client connected after waiting {}ms", (i + 1) * 10);
-                break;
-            }
-        }
-        
         if (!to_player) {
-            spdlog::warn("Real server still not connected, dropping packet");
-            enet_packet_destroy(packet);
-            return; 
+            // Keep the packet and replay it once the upstream link completes
+            // (Client::on_connect -> flush_pending_from_client). This used to drop
+            // the packet after a 50 ms wait, which ate the client's login hello
+            // whenever the upstream handshake lost that race: the server then saw
+            // an empty session and the client hung and gave up. Queuing turns the
+            // race harmless.
+            constexpr std::size_t kMaxQueuedPackets = 32;
+            if (pending_from_client_.size() >= kMaxQueuedPackets) {
+                spdlog::warn("Upstream still not connected and pending queue full; dropping packet");
+                enet_packet_destroy(packet);
+                return;
+            }
+            pending_from_client_.push_back(packet);
+            return;
         }
-    }
 
     ByteStream<std::uint16_t> byte_stream{ reinterpret_cast<std::byte*>(packet->data), packet->dataLength };
     
@@ -615,6 +617,16 @@ void Server::on_disconnect(ENetPeer* peer)
         peer->address.port
     );
 
+    // With multiple peer slots, a DISCONNECT event can arrive for a peer that was
+    // superseded (replaced in on_connect) or rejected while no player existed. That
+    // goodbye must not tear down the live session: only the peer of the current
+    // session may end it.
+    if (player_ && player_->get_peer() != peer) {
+        spdlog::warn("[ENET] Ignoring disconnect event for a superseded client peer {}:{}",
+                     network::format_ip_address(peer->address.host), peer->address.port);
+        return;
+    }
+
     if (!player_) {
         return;
     }
@@ -639,10 +651,37 @@ void Server::on_disconnect(ENetPeer* peer)
 
     delete player_;
     player_ = nullptr;
-    
+
+    clear_pending();
+
     if (host_) {
         const net::ENetLock guard{ net::enet_traffic_mutex() };
         enet_host_flush(host_);
     }
+}
+
+void Server::flush_pending_from_client()
+{
+    // Called from Client::on_connect while the shared ENet traffic lock is held, the
+    // same lock that guards on_receive, so the deque needs no separate mutex.
+    while (!pending_from_client_.empty()) {
+        ENetPeer* peer = player_ ? player_->get_peer() : nullptr;
+        if (!peer) {
+            // The upstream link went away again; keep the rest queued for the next
+            // connect attempt.
+            return;
+        }
+        ENetPacket* packet = pending_from_client_.front();
+        pending_from_client_.pop_front();
+        on_receive(peer, packet);
+    }
+}
+
+void Server::clear_pending()
+{
+    for (ENetPacket* packet : pending_from_client_) {
+        enet_packet_destroy(packet);
+    }
+    pending_from_client_.clear();
 }
 }

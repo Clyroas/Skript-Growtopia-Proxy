@@ -295,6 +295,11 @@ void Client::on_connect(ENetPeer* peer)
     core::EventConnection event_connection{ *player_ };
     event_connection.from = core::EventFrom::FromServer;
     core_->get_event_dispatcher().dispatch(event_connection);
+
+    // The client may have sent its login packets while this handshake was still
+    // completing; the server side queued them. Replay them now, in order, so the
+    // fresh session starts from its real handshake instead of a silent hole.
+    core_->get_server()->flush_pending_from_client();
 }
 
 void Client::on_receive(ENetPeer* peer, ENetPacket* packet)
@@ -839,6 +844,18 @@ void Client::handle_redirected_packet(ByteStream<std::uint16_t>& byte_stream, pl
 
 void Client::on_disconnect(ENetPeer* peer)
 {
+    // With multiple peer slots, a DISCONNECT event can be delivered for a stale peer:
+    // a superseded session the server retired, or a connect attempt that timed out
+    // while still occupying a slot. Only the peer of the current session may tear that
+    // session down - treating a stale peer's goodbye as the live session's own killed
+    // every fresh reconnect and looked like "random disconnects" (and, to the player,
+    // like the last feature they used was at fault).
+    if (player_ && player_->get_peer() != peer) {
+        spdlog::warn("[ENET] Ignoring disconnect event for a non-active upstream peer {}:{}",
+                     network::format_ip_address(peer->address.host), peer->address.port);
+        return;
+    }
+
     spdlog::info(
         "Server connection terminated: {}:{}",
         network::format_ip_address(peer->address.host),
