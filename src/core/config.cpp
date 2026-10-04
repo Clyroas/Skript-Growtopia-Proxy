@@ -18,6 +18,11 @@ static const std::map<std::string, ConfigStorage> config_defaults{
     { "log.printMessage", true },
     { "log.printGameUpdatePacket", false },
     { "log.printVariant", true },
+    // Mouse-aimed autopath: key is a Win32 virtual-key code (45 = VK_INSERT),
+    // mode is "auto" (walk if a path exists, else teleport), "walk" or "teleport".
+    { "command.autopath.enabled", true },
+    { "command.autopath.key", 45 },
+    { "command.autopath.mode", std::string("auto") },
     { "filter.rate_limit", 300 },
     { "filter.allow_burst", true },
     { "display.visual_name", "" },

@@ -96,6 +96,10 @@ public:
 
     static void set_core(core::Core* core);
 
+    // The ImGui GUI reads this to reach config/players for the mouse-autopath
+    // keybind; the proxy owns the lifetime and set_core() runs at startup.
+    static core::Core* get_core() { return s_core; }
+
     // Sends one PACKET_STATE that moves the local player to a tile position.
     // Shared with ScanPathCommand's teleport traversal.
     static bool send_teleport_to(client::Client* client, uint32_t tile_x, uint32_t tile_y);

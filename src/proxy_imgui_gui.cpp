@@ -14,6 +14,11 @@
 #include "extension/command_handler/moddetect_command.hpp"   
 #include "extension/command_handler/doorid_command.hpp"
 #include "extension/command_handler/autocollect_command.hpp"
+#include "extension/command_handler/utility_commands.hpp"
+#include "utils/packet_utils.hpp"
+#include "client/client.hpp"
+#include "server/server.hpp"
+#include <fmt/format.h>
 #include "utils/lua_manager.hpp"
 #include "utils/lua_bridge.hpp"
 #include "utils/world_manager.hpp"
@@ -37,6 +42,8 @@
 #include <fstream> 
 #include <string_view>
 #include <cstring>
+#include <atomic>
+#include <thread>
 
 #pragma comment(lib, "d3d9.lib")
 
@@ -323,6 +330,144 @@ static void UpdateDoorIdOverlay() {
     DeleteObject(bitmap);
     DeleteDC(memory_dc);
     ReleaseDC(nullptr, screen_dc);
+}
+
+
+// ---------------------------------------------------------------------------
+// Mouse-aimed autopath
+//
+// Press the configured key and the player walks to the tile under the mouse
+// cursor over the Growtopia window; if no walkable path exists, the "auto"
+// mode falls back to a direct teleport ("walk"/"teleport" force one behavior).
+// The screen->tile mapping inverts the door overlay's camera model:
+//   screen = center + (tile + 0.5 - camera) * 32, camera = clamped player tile.
+// ---------------------------------------------------------------------------
+
+static std::atomic<bool> g_autopath_running{ false };
+
+static void RunAutoPathTo(core::Core* core, uint32_t tile_x, uint32_t tile_y) {
+    // One action at a time: the walk variant blocks its worker for seconds, and
+    // keypress spam must not stack overlapping pathfinders (packet storms).
+    if (g_autopath_running.exchange(true)) {
+        return;
+    }
+
+    std::thread([core, tile_x, tile_y]() {
+        auto* client = core ? core->get_client() : nullptr;
+        auto* server = core ? core->get_server() : nullptr;
+        player::Player* local = server ? server->get_player() : nullptr;
+        if (!client || !local) {
+            g_autopath_running = false;
+            return;
+        }
+
+        std::string mode = "auto";
+        try {
+            mode = core->get_config().get<std::string>("command.autopath.mode", std::string("auto"));
+        } catch (...) {}
+        std::transform(mode.begin(), mode.end(), mode.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+        auto chat = [local](const std::string& msg) {
+            utils::PacketUtils::send_chat_message(local, msg);
+        };
+
+        if (mode == "teleport") {
+            if (command::TeleportCommand::send_teleport_to(client, tile_x, tile_y)) {
+                chat(fmt::format("`9Autopath: teleported to `w({}, {})`9.", tile_x, tile_y));
+            }
+        } else {
+            const int steps = command::FindPathCommand::run_path(client, tile_x, tile_y, false);
+            if (steps > 0) {
+                chat(fmt::format("`2Autopath: walked {} step(s) to `w({}, {})`2.", steps, tile_x, tile_y));
+            } else if (mode == "walk") {
+                chat(fmt::format("`4Autopath: no walkable path to `w({}, {})`4.", tile_x, tile_y));
+            } else if (command::TeleportCommand::send_teleport_to(client, tile_x, tile_y)) {
+                chat(fmt::format("`9Autopath: no walkable path to `w({}, {})`9 - teleported instead.", tile_x, tile_y));
+            }
+        }
+
+        g_autopath_running = false;
+    }).detach();
+}
+
+static void UpdateAutoPathKeybind() {
+    static bool prev_down = false;
+
+    auto* core = command::TeleportCommand::get_core();
+    if (!core) {
+        prev_down = false;
+        return;
+    }
+
+    bool enabled = true;
+    int key = 45;  // VK_INSERT
+    try {
+        enabled = core->get_config().get<bool>("command.autopath.enabled", true);
+        key = core->get_config().get<int>("command.autopath.key", 45);
+    } catch (...) {}
+    if (!enabled || key <= 0) {
+        prev_down = false;
+        return;
+    }
+
+    // Edge-triggered: fire once per physical press, wherever the key is held.
+    const bool down = (GetAsyncKeyState(key) & 0x8000) != 0;
+    const bool pressed = down && !prev_down;
+    prev_down = down;
+    if (!pressed) return;
+
+    // Same gating as the door overlay: the Growtopia window must exist and be in
+    // the foreground (or the proxy window is), so typing elsewhere never triggers.
+    const ULONGLONG now = GetTickCount64();
+    if (now >= g_next_game_window_scan || !IsWindow(g_growtopia_hwnd)) {
+        g_growtopia_hwnd = nullptr;
+        EnumWindows(FindGrowtopiaWindow, reinterpret_cast<LPARAM>(&g_growtopia_hwnd));
+        g_next_game_window_scan = now + 1500;
+    }
+    if (!g_growtopia_hwnd || IsIconic(g_growtopia_hwnd)) return;
+    const HWND foreground = GetForegroundWindow();
+    if (foreground != g_growtopia_hwnd && foreground != g_hWnd) return;
+
+    auto& world_manager = utils::WorldManager::get_instance();
+    if (!world_manager.has_world()) return;
+    const uint32_t world_w = world_manager.get_world_width();
+    const uint32_t world_h = world_manager.get_world_height();
+    if (world_w == 0 || world_h == 0) return;
+
+    const auto local = utils::PlayerTracker::get_instance().get_local_player();
+    if (local.netID == 0) return;
+
+    RECT client{};
+    if (!GetClientRect(g_growtopia_hwnd, &client)) return;
+    const int width = client.right - client.left;
+    const int height = client.bottom - client.top;
+    if (width <= 0 || height <= 0 || width > 8192 || height > 8192) return;
+
+    POINT mouse{};
+    if (!GetCursorPos(&mouse) || !ScreenToClient(g_growtopia_hwnd, &mouse)) return;
+    if (mouse.x < 0 || mouse.y < 0 || mouse.x >= width || mouse.y >= height) return;
+
+    constexpr float tile_px = 32.0f;
+    const float view_tiles_x = static_cast<float>(width) / tile_px;
+    const float view_tiles_y = static_cast<float>(height) / tile_px;
+    const float player_tile_x = local.position.x / tile_px;
+    const float player_tile_y = local.position.y / tile_px;
+    const float camera_x = std::clamp(player_tile_x, view_tiles_x * 0.5f,
+        std::max(view_tiles_x * 0.5f, static_cast<float>(world_w) - view_tiles_x * 0.5f));
+    const float camera_y = std::clamp(player_tile_y, view_tiles_y * 0.5f,
+        std::max(view_tiles_y * 0.5f, static_cast<float>(world_h) - view_tiles_y * 0.5f));
+
+    const float tile_fx = camera_x - 0.5f + (static_cast<float>(mouse.x) - width * 0.5f) / tile_px;
+    const float tile_fy = camera_y - 0.5f + (static_cast<float>(mouse.y) - height * 0.5f) / tile_px;
+    const auto tile_x = static_cast<int>(std::floor(tile_fx));
+    const auto tile_y = static_cast<int>(std::floor(tile_fy));
+    if (tile_x < 0 || tile_y < 0 ||
+        tile_x >= static_cast<int>(world_w) || tile_y >= static_cast<int>(world_h)) {
+        return;
+    }
+
+    RunAutoPathTo(core, static_cast<uint32_t>(tile_x), static_cast<uint32_t>(tile_y));
 }
 
 
@@ -992,6 +1137,25 @@ static void TabWorld() {
     }
     if (reveal_door_ids && wm.has_world()) {
         ImGui::TextDisabled("Labels are drawn over door tiles in the Growtopia window while it is open.");
+    }
+
+    if (auto* gui_core = command::TeleportCommand::get_core()) {
+        bool autopath_enabled = true;
+        int autopath_key = 45;
+        std::string autopath_mode = "auto";
+        try {
+            autopath_enabled = gui_core->get_config().get<bool>("command.autopath.enabled", true);
+            autopath_key = gui_core->get_config().get<int>("command.autopath.key", 45);
+            autopath_mode = gui_core->get_config().get<std::string>("command.autopath.mode", std::string("auto"));
+        } catch (...) {}
+
+        if (ImGui::Checkbox("Mouse autopath (walk to cursor tile, teleport if blocked)", &autopath_enabled)) {
+            gui_core->get_config().set<bool>("command.autopath.enabled", autopath_enabled);
+            AppendLog(std::string("[GUI] Mouse autopath ") + (autopath_enabled ? "ENABLED" : "DISABLED"));
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("key: 0x%02X, mode: %s", autopath_key, autopath_mode.c_str());
+        ImGui::TextDisabled("Set command.autopath.key / .mode in config.json (45 = Insert).");
     }
 
     
@@ -1683,6 +1847,7 @@ void RunImGuiApp() {
 
         HRESULT hr = g_pd3dDevice->Present(nullptr, nullptr, nullptr, nullptr);
         UpdateDoorIdOverlay();
+        UpdateAutoPathKeybind();
         if (hr == D3DERR_DEVICELOST &&
             g_pd3dDevice->TestCooperativeLevel() == D3DERR_DEVICENOTRESET)
             ResetDevice();

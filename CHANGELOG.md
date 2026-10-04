@@ -1,5 +1,24 @@
 # Changelog
 
+## [2.4.0] — Mouse-aimed autopath keybind
+
+Point the mouse anywhere in the Growtopia window and press **Insert**: the player
+automatically walks there along the available path, and if no walkable path exists
+the `auto` mode teleports straight to the tile instead.
+
+- The destination is the tile under the mouse arrow, computed with the same
+  camera model the door-ID overlay uses, so the marker lands where you point.
+- Keybind, mode, and enable flag are config-backed: `command.autopath.key`
+  (Win32 virtual-key code, 45 = Insert), `command.autopath.mode`
+  (`auto` / `walk` / `teleport`), `command.autopath.enabled`. A checkbox in the
+  proxy GUI toggles it and shows the current key and mode.
+- The keybind only fires when the Growtopia (or proxy) window is foreground, so
+  typing or working elsewhere never triggers a move. Each press runs at most one
+  action: walk mode runs on a worker thread and further presses are ignored
+  until it finishes, preventing overlapping pathfinder packet storms.
+- Walk uses the same A* pathfinder as `/findpath` (config `command.path.delay_ms`
+  paces the steps); teleport reuses the `/tp` packet helper.
+
 ## [2.3.4] — Logins work again: silent handshake hangs fixed
 
 The post-2.3.3 log showed the real reason relogging had become hard: of 48 client
