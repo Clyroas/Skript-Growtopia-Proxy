@@ -1,5 +1,31 @@
 # Changelog
 
+## [2.3.4] — Logins work again: silent handshake hangs fixed
+
+The post-2.3.3 log showed the real reason relogging had become hard: of 48 client
+connect attempts, 26 upstream ENet handshakes never completed and **nothing noticed**.
+The game client hung, timed out, retried, and eventually tripped the game server's
+`Fail to login. Please try again in 30 seconds` rate limiter.
+
+### Fixed — handshake hangs were invisible
+
+- The connect-timeout watchdog only armed in the non-HTTPS flow; with the HTTPS
+  extension (the normal setup) it never ran. A watchdog now lives in the client's
+  service loop and fires 5 s after any handshake that stays unanswered.
+- One silent retry absorbs a lost UDP handshake. After that the proxy tells the
+  player `Can't reach the server` immediately instead of letting the game hang -
+  which also stops the retry storm that fed the rate limiter.
+- `connect()` resets a still-pending previous handshake before starting a new one,
+  so only one handshake is ever in flight and failed ones stop leaking peer slots.
+
+### Fixed — reconnect handshakes were left unanswered by design
+
+The game server does not answer a new login handshake while that account's previous
+session is still open. The proxy used to leave the old upstream link to die on its
+own timeout, so every reconnect raced a 15-20 s zombie. `Server::on_connect` now
+tears the previous upstream session down **immediately** when the client
+reconnects, which is what makes the very next handshake get answered.
+
 ## [2.3.3] — Disconnects after using features in crowded worlds
 
 The log from the post-2.3.1 run showed the remaining kill path precisely: a fresh

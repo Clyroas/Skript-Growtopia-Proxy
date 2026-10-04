@@ -1,6 +1,8 @@
 #pragma once
 #include <enet/enet.h>
+#include <chrono>
 #include <cstdint>
+#include <string>
 
 #include "../core/core.hpp"
 #include "../player/player.hpp"
@@ -12,7 +14,7 @@ public:
     explicit Client(core::Core* core);
     ~Client();
 
-    [[nodiscard]] ENetPeer* connect(const std::string& host, enet_uint16 port) const;
+    [[nodiscard]] ENetPeer* connect(const std::string& host, enet_uint16 port);
     void process();
 
     void on_connect(ENetPeer* peer);
@@ -46,5 +48,17 @@ private:
     // reused by ENet once their slot is freed, so a bare pointer comparison cannot
     // tell a live session from a stale event delivered on a recycled peer.
     std::uint32_t active_upstream_connect_id_ = 0;
+
+    // In-flight upstream handshake, watched by process(): the old watchdog only ran
+    // in the non-HTTPS flow, so a handshake the game server never answered (usually
+    // because the previous session was still open) hung silently - the game client
+    // timed out, retried, and tripped the server's login rate limiter.
+    ENetPeer* pending_connect_peer_ = nullptr;
+    std::chrono::steady_clock::time_point pending_connect_since_{};
+    std::string connect_target_host_;
+    enet_uint16 connect_target_port_ = 0;
+    int connect_attempts_ = 0;
+
+    void retry_or_fail_pending_connect(const char* reason);
 };
 }

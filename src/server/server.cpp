@@ -170,6 +170,11 @@ void Server::on_connect(ENetPeer* peer)
         }
         delete player_;
         player_ = nullptr;
+        // The game server does not answer a new handshake while this client's
+        // previous session is still open, so the old upstream link must die NOW -
+        // waiting for its timeout is exactly what made reconnect handshakes hang
+        // silently and turned relogging into a rate-limited retry storm.
+        core_->get_client()->on_local_disconnect();
     }
 
     // Login packets queued by a previous client session belong to that dead session;

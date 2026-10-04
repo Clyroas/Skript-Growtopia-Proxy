@@ -168,7 +168,7 @@ Client::~Client()
     delete player_;
 }
 
-ENetPeer* Client::connect(const std::string& host, const enet_uint16 port) const
+ENetPeer* Client::connect(const std::string& host, const enet_uint16 port)
 {
     if (!host_) {
         spdlog::error("[ENET] connect('{}', {}) but the upstream host is null", host, port);
@@ -187,6 +187,16 @@ ENetPeer* Client::connect(const std::string& host, const enet_uint16 port) const
 
     const net::ENetLock guard{ net::enet_traffic_mutex() };
 
+    // A still-pending handshake from an earlier connect is dead weight: it never
+    // completes (the server ignores it while the previous session is open) and it
+    // occupies a peer slot. Reset it so only one handshake is ever in flight.
+    if (pending_connect_peer_ && pending_connect_peer_->state == ENET_PEER_STATE_CONNECTING) {
+        spdlog::warn("[ENET] dropping unanswered handshake to {}:{} before reconnecting",
+                     connect_target_host_, connect_target_port_);
+        enet_peer_reset(pending_connect_peer_);
+    }
+    pending_connect_peer_ = nullptr;
+
     ENetPeer* peer{ enet_host_connect(host_, &address, 2, 0) };
     if (!peer) {
         // Returns NULL when no peer slot is free (or on failure). Ignored at every call
@@ -196,8 +206,16 @@ ENetPeer* Client::connect(const std::string& host, const enet_uint16 port) const
         return nullptr;
     }
 
-    spdlog::info("[ENET] connecting upstream to '{}' -> {}:{} (peer slots in use on this host)",
-                 host, network::format_ip_address(address.host), port);
+    connect_attempts_ = (host == connect_target_host_ && port == connect_target_port_)
+                            ? connect_attempts_ + 1
+                            : 1;
+    connect_target_host_ = host;
+    connect_target_port_ = port;
+    pending_connect_peer_ = peer;
+    pending_connect_since_ = std::chrono::steady_clock::now();
+
+    spdlog::info("[ENET] connecting upstream to '{}' -> {}:{} (attempt {}, peer slots in use on this host)",
+                 host, network::format_ip_address(address.host), port, connect_attempts_);
     return peer;
 }
 
@@ -207,6 +225,32 @@ void Client::process()
         return;
     }
 
+    // Watchdog for the in-flight upstream handshake. The legacy watchdog below only
+    // arms in the non-HTTPS flow; with the HTTPS extension (the normal setup) a
+    // handshake the game server never answered hung forever - the game client timed
+    // out, retried, and tripped the server's "try again in 30 seconds" rate limiter,
+    // which the player experienced as logins getting harder and harder.
+    if (pending_connect_peer_) {
+        const auto pending_elapsed = std::chrono::steady_clock::now() - pending_connect_since_;
+        if (pending_elapsed >= std::chrono::seconds(5)) {
+            spdlog::warn("[CONNECTION] Upstream handshake to {}:{} got no answer within 5s (attempt {})",
+                         connect_target_host_, connect_target_port_, connect_attempts_);
+            bool still_connecting = false;
+            {
+                const net::ENetLock guard{ net::enet_traffic_mutex() };
+                still_connecting = pending_connect_peer_->state == ENET_PEER_STATE_CONNECTING;
+                if (still_connecting) {
+                    enet_peer_reset(pending_connect_peer_);
+                }
+            }
+            pending_connect_peer_ = nullptr;
+            // If it stopped being CONNECTING, the handshake completed and its event
+            // is about to be serviced below - leave the session alone.
+            if (still_connecting) {
+                retry_or_fail_pending_connect("upstream handshake timeout");
+            }
+        }
+    }
     
     if (g_connect_pending) {
         const auto now = std::chrono::steady_clock::now();
@@ -265,7 +309,9 @@ void Client::process()
 
 void Client::on_connect(ENetPeer* peer)
 {
-    g_connect_pending = false; 
+    g_connect_pending = false;
+    pending_connect_peer_ = nullptr;
+    connect_attempts_ = 0;
     spdlog::info(
         "Server connection established: {}:{}",
         network::format_ip_address(peer->address.host),
@@ -843,9 +889,41 @@ void Client::handle_redirected_packet(ByteStream<std::uint16_t>& byte_stream, pl
     to_player->send_packet(byte_stream.get_data(), 0);
 }
 
+void Client::retry_or_fail_pending_connect(const char* reason)
+{
+    auto* server = core_->get_server();
+    player::Player* local = server ? server->get_player() : nullptr;
+
+    // One silent retry absorbs a lost UDP handshake; after that, surface a real
+    // error so the player sees "can't reach the server" instead of the game
+    // hanging, timing out and hammering the login endpoint into its rate limiter.
+    if (connect_attempts_ <= 1) {
+        spdlog::warn("[CONNECTION] {} - retrying {}:{} once", reason,
+                     connect_target_host_, connect_target_port_);
+        if (!connect_target_host_.empty()) {
+            std::ignore = connect(connect_target_host_, connect_target_port_);
+        }
+        return;
+    }
+
+    spdlog::error("[CONNECTION] {} - giving up on {}:{}", reason,
+                  connect_target_host_, connect_target_port_);
+    connect_attempts_ = 0;
+    if (local) {
+        send_connection_error_msg(local);
+    }
+}
+
 void Client::on_local_disconnect()
 {
     active_upstream_connect_id_ = 0;
+    if (pending_connect_peer_) {
+        const net::ENetLock guard{ net::enet_traffic_mutex() };
+        if (pending_connect_peer_->state == ENET_PEER_STATE_CONNECTING) {
+            enet_peer_reset(pending_connect_peer_);
+        }
+        pending_connect_peer_ = nullptr;
+    }
     if (!player_) {
         return;
     }
@@ -875,6 +953,12 @@ void Client::on_disconnect(ENetPeer* peer)
         if (!player_ && socks5_tunnel::is_active()) {
             socks5_tunnel::disconnect();
             spdlog::info("[SOCKS5] Tunnel closed on upstream teardown");
+        }
+        // A refused/abandoned handshake reports as a disconnect for the pending
+        // peer. ENet has already reset it; just decide whether to retry.
+        if (peer == pending_connect_peer_) {
+            pending_connect_peer_ = nullptr;
+            retry_or_fail_pending_connect("upstream refused the handshake");
         }
         return;
     }
