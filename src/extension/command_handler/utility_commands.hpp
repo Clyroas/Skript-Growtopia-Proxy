@@ -69,7 +69,8 @@ public:
 
 private:
     static void run_scanpath(std::uint64_t generation, std::string world_name,
-                             std::vector<std::pair<uint32_t, uint32_t>> markers);
+                             std::vector<std::pair<uint32_t, uint32_t>> markers,
+                             bool teleport_mode);
     static core::Core* s_core;
     static std::atomic<bool> s_running;
     static std::atomic<std::uint64_t> s_generation;
@@ -80,9 +81,25 @@ public:
     PlayerTPCommand();
     void execute(client::Client* client, const std::vector<std::string>& args) override;
     std::unique_ptr<CommandBase> clone() const override;
-    
+
     static void set_core(core::Core* core);
-    
+
+private:
+    static core::Core* s_core;
+};
+
+class TeleportCommand : public CommandBase {
+public:
+    TeleportCommand();
+    void execute(client::Client* client, const std::vector<std::string>& args) override;
+    std::unique_ptr<CommandBase> clone() const override;
+
+    static void set_core(core::Core* core);
+
+    // Sends one PACKET_STATE that moves the local player to a tile position.
+    // Shared with ScanPathCommand's teleport traversal.
+    static bool send_teleport_to(client::Client* client, uint32_t tile_x, uint32_t tile_y);
+
 private:
     static core::Core* s_core;
 };

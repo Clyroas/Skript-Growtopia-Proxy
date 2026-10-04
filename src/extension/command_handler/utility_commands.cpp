@@ -58,6 +58,7 @@ core::Core* ScanPathCommand::s_core = nullptr;
 std::atomic<bool> ScanPathCommand::s_running{ false };
 std::atomic<std::uint64_t> ScanPathCommand::s_generation{ 0 };
 core::Core* PlayerTPCommand::s_core = nullptr;
+core::Core* TeleportCommand::s_core = nullptr;
 core::Core* FlagCommand::s_core = nullptr;
 core::Core* InvisCommand::s_core = nullptr;
 bool InvisCommand::s_invis_enabled = false;
@@ -146,8 +147,8 @@ void FindPathCommand::set_core(core::Core* core) {
 
 ScanPathCommand::ScanPathCommand() : CommandBase(
     {"scanpath", "sp"},
-    {"[scan]"},
-    "Scan Path Marker tiles (item 1684); /sp traverses them in map order, /sp again stops.",
+    {"[scan|tp]"},
+    "Scan Path Marker tiles (item 1684); /sp walks them, /sp tp teleports; /sp again stops.",
     0
 ) {}
 
@@ -225,18 +226,22 @@ void ScanPathCommand::execute(client::Client* client, const std::vector<std::str
         return;
     }
 
+    const bool teleport_mode = args.size() > 1 && (args[1] == "tp" || args[1] == "teleport");
+
     s_running = true;
     const uint64_t gen = ++s_generation;
     const std::string world_name = wm.get_world_name();
-    send_console(server->get_player(),
-        fmt::format("`2Traversing {} Path Marker(s) in map order. Run /sp again to stop.", markers.size()));
-    std::thread([gen, world_name, markers = std::move(markers)]() mutable {
-        run_scanpath(gen, std::move(world_name), std::move(markers));
+    send_console(server->get_player(), teleport_mode
+        ? fmt::format("`2Teleporting through {} Path Marker(s) in map order. Run /sp again to stop.", markers.size())
+        : fmt::format("`2Traversing {} Path Marker(s) in map order. Run /sp again to stop.", markers.size()));
+    std::thread([gen, world_name, markers = std::move(markers), teleport_mode]() mutable {
+        run_scanpath(gen, std::move(world_name), std::move(markers), teleport_mode);
     }).detach();
 }
 
 void ScanPathCommand::run_scanpath(std::uint64_t generation, std::string world_name,
-                                   std::vector<std::pair<uint32_t, uint32_t>> markers) {
+                                   std::vector<std::pair<uint32_t, uint32_t>> markers,
+                                   bool teleport_mode) {
     size_t reached = 0;
     for (const auto& marker : markers) {
         if (!s_running.load() || generation != s_generation.load()) return;
@@ -253,6 +258,15 @@ void ScanPathCommand::run_scanpath(std::uint64_t generation, std::string world_n
         send_console(server->get_player(),
             fmt::format("`oPath Marker {} of {} at ({}, {}).", reached + 1, markers.size(),
                 marker.first, marker.second));
+        if (teleport_mode) {
+            if (!TeleportCommand::send_teleport_to(client, marker.first, marker.second)) {
+                send_console(server->get_player(), "`4Teleport failed; not connected. Stopping.");
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(150));
+            ++reached;
+            continue;
+        }
         const int steps = FindPathCommand::run_path(client, marker.first, marker.second, false, 55);
         if (steps <= 0) {
             send_console(server->get_player(),
@@ -593,7 +607,148 @@ void PlayerTPCommand::execute(client::Client* client, const std::vector<std::str
     
     
     
-    spdlog::info("Attempting to TP to player: {}", player_name);
+    auto lowercase = [](std::string value) {
+        std::transform(value.begin(), value.end(), value.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return value;
+    };
+    const std::string wanted = lowercase(player_name);
+
+    auto players = utils::PlayerTracker::get_instance().get_all_players();
+    const utils::PlayerTracker::PlayerInfo* match = nullptr;
+    for (const auto& [netid, info] : players) {
+        if (info.is_local || info.name.empty()) continue;
+        std::string name = info.name;
+        size_t color_pos = 0;
+        while ((color_pos = name.find('`')) != std::string::npos) {
+            if (color_pos + 1 < name.length()) {
+                name.erase(color_pos, 2);
+            } else {
+                break;
+            }
+        }
+        if (lowercase(name) == wanted) {
+            match = &info;
+            break;
+        }
+    }
+
+    if (!match) {
+        send_console(server->get_player(),
+            fmt::format("`4No tracked player named `{}` ({} player(s) tracked).", player_name, players.size()));
+        return;
+    }
+
+    if (match->position.x <= 0.0f && match->position.y <= 0.0f) {
+        send_console(server->get_player(),
+            fmt::format("`4{}'s position is not known yet; wait a moment and retry.", match->name));
+        return;
+    }
+
+    const uint32_t tile_x = static_cast<uint32_t>(match->position.x / 32.0f);
+    const uint32_t tile_y = static_cast<uint32_t>(match->position.y / 32.0f);
+    if (!TeleportCommand::send_teleport_to(client, tile_x, tile_y)) {
+        send_console(server->get_player(), "`4Not connected to the game server.");
+        return;
+    }
+
+    spdlog::info("[PlayerTP] Teleported to {} ({:.1f},{:.1f}) at tile ({}, {})",
+                 match->name, match->position.x, match->position.y, tile_x, tile_y);
+    send_console(server->get_player(),
+        fmt::format("`9Teleported to `w{}`9 at tile `w({}, {})`9.", match->name, tile_x, tile_y));
+}
+
+TeleportCommand::TeleportCommand() : CommandBase(
+    {"tp"},
+    {"<tile_x>", "<tile_y>"},
+    "Teleport to a tile position in the current world",
+    2
+) {}
+
+std::unique_ptr<CommandBase> TeleportCommand::clone() const {
+    return std::make_unique<TeleportCommand>(*this);
+}
+
+void TeleportCommand::set_core(core::Core* core) {
+    s_core = core;
+}
+
+bool TeleportCommand::send_teleport_to(client::Client* client, uint32_t tile_x, uint32_t tile_y) {
+    if (!client || !client->get_player()) return false;
+
+    packet::TankUpdatePacket state{};
+    state.type            = static_cast<uint8_t>(packet::PACKET_STATE);
+    state.object_type     = 0;
+    state.jump_count      = 0;
+    state.animation_type  = 0;
+    state.net_id          = 0;
+    state.target_net_id   = 0;
+    state.flags           = 0x1u | packet::PACKET_FLAG_ON_SOLID;
+    state.float_var       = 0.0f;
+    state.int_data        = 0;
+    state.vec_x           = static_cast<float>(tile_x * 32);
+    state.vec_y           = static_cast<float>(tile_y * 32) + 2.0f;
+    state.vec_x2          = 0.0f;
+    state.vec_y2          = 0.0f;
+    state.particle_time   = 0.0f;
+    state.int_x           = -1;
+    state.int_y           = -1;
+    state.extra_data_size = 0;
+
+    ByteStream<std::uint16_t> bs{};
+    bs.write(packet::NET_MESSAGE_GAME_PACKET);
+    bs.write(state);
+    client->get_player()->send_packet_unreliable(bs.get_data(), 0);
+    return true;
+}
+
+void TeleportCommand::execute(client::Client* client, const std::vector<std::string>& args) {
+    if (!s_core || !client || !client->get_player()) return;
+    auto* server = s_core->get_server();
+    if (!server || !server->get_player()) return;
+
+    if (args.size() < 3) {
+        send_console(server->get_player(), "`4Usage: /tp <tile_x> <tile_y>");
+        return;
+    }
+
+    uint32_t tile_x = 0;
+    uint32_t tile_y = 0;
+    try {
+        const long parsed_x = std::stol(args[1]);
+        const long parsed_y = std::stol(args[2]);
+        if (parsed_x < 0 || parsed_y < 0) throw std::out_of_range("negative coordinate");
+        tile_x = static_cast<uint32_t>(parsed_x);
+        tile_y = static_cast<uint32_t>(parsed_y);
+    } catch (...) {
+        send_console(server->get_player(), "`4Invalid coordinates. Usage: /tp <tile_x> <tile_y>");
+        return;
+    }
+
+    auto& world_manager = utils::WorldManager::get_instance();
+    if (world_manager.has_world()) {
+        const uint32_t width = world_manager.get_world_width();
+        const uint32_t height = world_manager.get_world_height();
+        if (width > 0 && tile_x >= width) {
+            send_console(server->get_player(),
+                fmt::format("`4X {} is outside this world (width {}).", tile_x, width));
+            return;
+        }
+        if (height > 0 && tile_y >= height) {
+            send_console(server->get_player(),
+                fmt::format("`4Y {} is outside this world (height {}).", tile_y, height));
+            return;
+        }
+    }
+
+    if (!send_teleport_to(client, tile_x, tile_y)) {
+        send_console(server->get_player(), "`4Not connected to the game server.");
+        return;
+    }
+
+    spdlog::info("[Teleport] moved to tile ({}, {})", tile_x, tile_y);
+    send_console(server->get_player(),
+        fmt::format("`9Teleported to tile `w({}, {})`9.", tile_x, tile_y));
 }
 
 

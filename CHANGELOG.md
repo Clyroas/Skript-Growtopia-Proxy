@@ -1,5 +1,35 @@
 # Changelog
 
+## [2.3.0] — Teleporter and dropped-item detection
+
+### Added — teleporter
+
+- `/tp <tile_x> <tile_y>` teleports the local player to a tile position (validated
+  against the loaded world's dimensions before sending).
+- `/player <name>` is now functional: it looks the player up in the position tracker
+  (case- and colour-code-insensitive) and teleports to their last known position.
+- `/sp tp` traverses the scanpath marker list by teleporting through it instead of
+  pathfinding; `/sp`-again stop and world-change abort behave as in walk mode.
+
+### Fixed — floating items undetected in many worlds
+
+The dropped-items section of incoming world data was located by a loose heuristic
+that accepted the first plausible-looking offset. In many worlds it locked onto
+garbage (decoding zero items) or found nothing, so a world would load with tiles
+but report no dropped items at all. The scan now:
+
+- validates candidates structurally instead of accepting the first guess: the u32
+  list length must fit the remaining bytes, sampled uids should run consecutively,
+  and the u32 trailing the block should equal the last object's uid;
+- falls back to the next-best candidate when one decodes zero items, instead of
+  giving up;
+- widens the search window (128 -> 256 bytes) and the item-count ceiling
+  (15000 -> 100000);
+- widens coordinate plausibility to large custom worlds (8192 px) and rejects
+  non-finite floats;
+- warns with decoded/claimed counts when a header claims more items than were
+  decoded, so format variants are diagnosable in the log.
+
 ## [2.2.0] — Convenience commands, door-ID overlay, and scripting polish
 
 Builds on the 2.1.0 compatibility work with quality-of-life commands driven from the

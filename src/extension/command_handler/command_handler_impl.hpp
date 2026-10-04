@@ -136,6 +136,7 @@ public:
         command::ScanPathCommand::set_core(core_);
         command::RunCommand::set_core(core_);
         command::PlayerTPCommand::set_core(core_);
+        command::TeleportCommand::set_core(core_);
         command::FlagCommand::set_core(core_);
         command::InvisCommand::set_core(core_);
 
@@ -254,6 +255,7 @@ public:
         register_command(std::make_unique<command::FindPathCommand>());
         register_command(std::make_unique<command::ScanPathCommand>());
         register_command(std::make_unique<command::PlayerTPCommand>());
+        register_command(std::make_unique<command::TeleportCommand>());
         register_command(std::make_unique<command::FlagCommand>());
         register_command(std::make_unique<command::InvisCommand>());
         register_command(std::make_unique<command::SmCommand>());
