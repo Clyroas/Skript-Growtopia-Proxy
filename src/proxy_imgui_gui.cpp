@@ -336,35 +336,140 @@ static void UpdateDoorIdOverlay() {
 // ---------------------------------------------------------------------------
 // Mouse-aimed autopath
 //
-// Primary interaction (exact): hold the configured key and CLICK a tile - the
-// game client itself resolves the click to a tile and reports it in the
-// activate/change packet, which the proxy consumes and turns into the move.
-// No camera math is involved, so the destination is exactly where you clicked.
+// Primary interaction (exact, full world range): hold Left Ctrl (configurable)
+// and CLICK a tile. In-range clicks are resolved by the game client itself and
+// arrive as tile packets (exact). Out-of-range clicks are predicted from the
+// calibrated camera: every in-range click reveals the true camera origin (exact
+// tile + mouse position), and predictions extrapolate it by player movement, so
+// clicks anywhere from one end of the world to the other land on the pointed
+// tile. Out-of-range clicks wait 150 ms for the exact packet before falling
+// back to the prediction, so a target the game can report is never approximated.
 //
 // Hover fallback (approximate): with command.autopath.trigger = "hover",
-// pressing the key moves to the tile under the mouse arrow, using the same
-// camera model as the door overlay. Growtopia's camera leans toward the mouse
-// and smooths its motion, so hover targeting can be off by a tile or two.
+// pressing the key moves to the predicted tile under the mouse arrow.
 // ---------------------------------------------------------------------------
+
+static std::atomic<std::uint64_t> g_click_seq{ 0 };
+static std::atomic<LONG> g_click_screen_x{ 0 };
+static std::atomic<LONG> g_click_screen_y{ 0 };
+
+static LRESULT CALLBACK AutoPathMouseHook(int code, WPARAM wparam, LPARAM lparam) {
+    if (code == HC_ACTION && wparam == WM_LBUTTONDOWN) {
+        const auto* info = reinterpret_cast<const MSLLHOOKSTRUCT*>(lparam);
+        g_click_screen_x = info->pt.x;
+        g_click_screen_y = info->pt.y;
+        g_click_seq.fetch_add(1, std::memory_order_relaxed);
+    }
+    return CallNextHookEx(nullptr, code, wparam, lparam);
+}
+
+static bool AutoPathEnabled(int& key, std::string& trigger) {
+    auto* core = command::TeleportCommand::get_core();
+    if (!core) return false;
+    key = 162;
+    trigger = "click";
+    try {
+        if (!core->get_config().get<bool>("command.autopath.enabled", true)) return false;
+        key = core->get_config().get<int>("command.autopath.key", 162);
+        trigger = core->get_config().get<std::string>("command.autopath.trigger", std::string("click"));
+    } catch (...) {}
+    return key > 0;
+}
+
+// Mouse (client px) -> world tile. Camera source: the measured calibration
+// extrapolated by player movement when available, else the door overlay's
+// clamped-player model.
+static bool AutoPathMouseToTile(const POINT& mouse_client, int& tile_x, int& tile_y) {
+    auto& world_manager = utils::WorldManager::get_instance();
+    if (!world_manager.has_world()) return false;
+    const uint32_t world_w = world_manager.get_world_width();
+    const uint32_t world_h = world_manager.get_world_height();
+    if (world_w == 0 || world_h == 0) return false;
+
+    const auto local = utils::PlayerTracker::get_instance().get_local_player();
+    if (local.netID == 0) return false;
+
+    RECT client{};
+    if (!GetClientRect(g_growtopia_hwnd, &client)) return false;
+    const int width = client.right - client.left;
+    const int height = client.bottom - client.top;
+    if (width <= 0 || height <= 0 || width > 8192 || height > 8192) return false;
+
+    constexpr float tile_px = 32.0f;
+    const float view_tiles_x = static_cast<float>(width) / tile_px;
+    const float view_tiles_y = static_cast<float>(height) / tile_px;
+    const float player_tile_x = local.position.x / tile_px;
+    const float player_tile_y = local.position.y / tile_px;
+
+    double camera_x = 0.0;
+    double camera_y = 0.0;
+    if (!command::TeleportCommand::estimate_camera(camera_x, camera_y)) {
+        camera_x = std::clamp(player_tile_x, view_tiles_x * 0.5f,
+            std::max(view_tiles_x * 0.5f, static_cast<float>(world_w) - view_tiles_x * 0.5f));
+        camera_y = std::clamp(player_tile_y, view_tiles_y * 0.5f,
+            std::max(view_tiles_y * 0.5f, static_cast<float>(world_h) - view_tiles_y * 0.5f));
+    }
+
+    const float tile_fx = static_cast<float>(camera_x) - 0.5f
+        + (static_cast<float>(mouse_client.x) - width * 0.5f) / tile_px;
+    const float tile_fy = static_cast<float>(camera_y) - 0.5f
+        + (static_cast<float>(mouse_client.y) - height * 0.5f) / tile_px;
+    tile_x = static_cast<int>(std::floor(tile_fx));
+    tile_y = static_cast<int>(std::floor(tile_fy));
+    return tile_x >= 0 && tile_y >= 0 &&
+           tile_x < static_cast<int>(world_w) && tile_y < static_cast<int>(world_h);
+}
+
+// Per-frame consumer for globally captured left clicks: when the autopath key is
+// held and the click lands on the Growtopia window, move to the clicked tile.
+static void ConsumeAutoPathClicks() {
+    static std::uint64_t last_seq = 0;
+    const std::uint64_t seq = g_click_seq.load(std::memory_order_relaxed);
+    if (seq == last_seq) return;
+    last_seq = seq;
+
+    int key = 0;
+    std::string trigger;
+    if (!AutoPathEnabled(key, trigger) || trigger != "click") return;
+    if ((GetAsyncKeyState(key) & 0x8000) == 0) return;
+
+    // Same gating as the door overlay.
+    const ULONGLONG now = GetTickCount64();
+    if (now >= g_next_game_window_scan || !IsWindow(g_growtopia_hwnd)) {
+        g_growtopia_hwnd = nullptr;
+        EnumWindows(FindGrowtopiaWindow, reinterpret_cast<LPARAM>(&g_growtopia_hwnd));
+        g_next_game_window_scan = now + 1500;
+    }
+    if (!g_growtopia_hwnd || IsIconic(g_growtopia_hwnd)) return;
+    const HWND foreground = GetForegroundWindow();
+    if (foreground != g_growtopia_hwnd && foreground != g_hWnd) return;
+
+    POINT mouse{ g_click_screen_x.load(), g_click_screen_y.load() };
+    if (!ScreenToClient(g_growtopia_hwnd, &mouse)) return;
+
+    int tile_x = 0;
+    int tile_y = 0;
+    if (!AutoPathMouseToTile(mouse, tile_x, tile_y)) return;
+
+    // Give the game client ~150 ms to report this click exactly (it does for
+    // tiles within punch range). If its action already started, skip the
+    // prediction; otherwise act on the calibrated estimate.
+    const ULONGLONG click_ms = now;
+    const auto tx = static_cast<uint32_t>(tile_x);
+    const auto ty = static_cast<uint32_t>(tile_y);
+    std::thread([tx, ty, click_ms]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        if (command::TeleportCommand::last_autopath_action_ms() >= click_ms) return;
+        command::TeleportCommand::run_autopath_action(tx, ty);
+    }).detach();
+}
 
 static void UpdateAutoPathKeybind() {
     static bool prev_down = false;
 
-    auto* core = command::TeleportCommand::get_core();
-    if (!core) {
-        prev_down = false;
-        return;
-    }
-
-    bool enabled = true;
-    int key = 45;  // VK_INSERT
-    std::string trigger = "click";
-    try {
-        enabled = core->get_config().get<bool>("command.autopath.enabled", true);
-        key = core->get_config().get<int>("command.autopath.key", 45);
-        trigger = core->get_config().get<std::string>("command.autopath.trigger", std::string("click"));
-    } catch (...) {}
-    if (!enabled || key <= 0 || trigger != "hover") {
+    int key = 0;
+    std::string trigger;
+    if (!AutoPathEnabled(key, trigger) || trigger != "hover") {
         prev_down = false;
         return;
     }
@@ -387,43 +492,13 @@ static void UpdateAutoPathKeybind() {
     const HWND foreground = GetForegroundWindow();
     if (foreground != g_growtopia_hwnd && foreground != g_hWnd) return;
 
-    auto& world_manager = utils::WorldManager::get_instance();
-    if (!world_manager.has_world()) return;
-    const uint32_t world_w = world_manager.get_world_width();
-    const uint32_t world_h = world_manager.get_world_height();
-    if (world_w == 0 || world_h == 0) return;
-
-    const auto local = utils::PlayerTracker::get_instance().get_local_player();
-    if (local.netID == 0) return;
-
-    RECT client{};
-    if (!GetClientRect(g_growtopia_hwnd, &client)) return;
-    const int width = client.right - client.left;
-    const int height = client.bottom - client.top;
-    if (width <= 0 || height <= 0 || width > 8192 || height > 8192) return;
-
     POINT mouse{};
     if (!GetCursorPos(&mouse) || !ScreenToClient(g_growtopia_hwnd, &mouse)) return;
-    if (mouse.x < 0 || mouse.y < 0 || mouse.x >= width || mouse.y >= height) return;
+    if (mouse.x < 0 || mouse.y < 0) return;
 
-    constexpr float tile_px = 32.0f;
-    const float view_tiles_x = static_cast<float>(width) / tile_px;
-    const float view_tiles_y = static_cast<float>(height) / tile_px;
-    const float player_tile_x = local.position.x / tile_px;
-    const float player_tile_y = local.position.y / tile_px;
-    const float camera_x = std::clamp(player_tile_x, view_tiles_x * 0.5f,
-        std::max(view_tiles_x * 0.5f, static_cast<float>(world_w) - view_tiles_x * 0.5f));
-    const float camera_y = std::clamp(player_tile_y, view_tiles_y * 0.5f,
-        std::max(view_tiles_y * 0.5f, static_cast<float>(world_h) - view_tiles_y * 0.5f));
-
-    const float tile_fx = camera_x - 0.5f + (static_cast<float>(mouse.x) - width * 0.5f) / tile_px;
-    const float tile_fy = camera_y - 0.5f + (static_cast<float>(mouse.y) - height * 0.5f) / tile_px;
-    const auto tile_x = static_cast<int>(std::floor(tile_fx));
-    const auto tile_y = static_cast<int>(std::floor(tile_fy));
-    if (tile_x < 0 || tile_y < 0 ||
-        tile_x >= static_cast<int>(world_w) || tile_y >= static_cast<int>(world_h)) {
-        return;
-    }
+    int tile_x = 0;
+    int tile_y = 0;
+    if (!AutoPathMouseToTile(mouse, tile_x, tile_y)) return;
 
     command::TeleportCommand::run_autopath_action(
         static_cast<uint32_t>(tile_x), static_cast<uint32_t>(tile_y));
@@ -1100,23 +1175,23 @@ static void TabWorld() {
 
     if (auto* gui_core = command::TeleportCommand::get_core()) {
         bool autopath_enabled = true;
-        int autopath_key = 45;
+        int autopath_key = 162;
         std::string autopath_mode = "auto";
         std::string autopath_trigger = "click";
         try {
             autopath_enabled = gui_core->get_config().get<bool>("command.autopath.enabled", true);
-            autopath_key = gui_core->get_config().get<int>("command.autopath.key", 45);
+            autopath_key = gui_core->get_config().get<int>("command.autopath.key", 162);
             autopath_mode = gui_core->get_config().get<std::string>("command.autopath.mode", std::string("auto"));
             autopath_trigger = gui_core->get_config().get<std::string>("command.autopath.trigger", std::string("click"));
         } catch (...) {}
 
-        if (ImGui::Checkbox("Mouse autopath: hold key + click a tile (walk, teleport if blocked)", &autopath_enabled)) {
+        if (ImGui::Checkbox("Mouse autopath: hold Left Ctrl + click a tile (walk, teleport if blocked)", &autopath_enabled)) {
             gui_core->get_config().set<bool>("command.autopath.enabled", autopath_enabled);
             AppendLog(std::string("[GUI] Mouse autopath ") + (autopath_enabled ? "ENABLED" : "DISABLED"));
         }
         ImGui::SameLine();
         ImGui::TextDisabled("key: 0x%02X, mode: %s, trigger: %s", autopath_key, autopath_mode.c_str(), autopath_trigger.c_str());
-        ImGui::TextDisabled("Hold the key and click a tile for exact targeting. trigger=hover in config.json uses the approximate mouse-hover mode.");
+        ImGui::TextDisabled("Works across the whole world: in-range clicks are exact, farther clicks use the self-calibrating camera (click near yourself once to calibrate).");
         if (autopath_enabled) {
             ImGui::TextDisabled("While the key is held, your clicks are consumed by autopath (no punching).");
         }
@@ -1774,6 +1849,12 @@ void RunImGuiApp() {
     bool show = true;
     MSG  msg  = {};
 
+    // System-wide left-click capture for the autopath keybind. The hook itself
+    // only stores the cursor position; all filtering happens per-frame in
+    // ConsumeAutoPathClicks. Requires this thread to pump messages, which the
+    // loop below does.
+    HHOOK autopath_mouse_hook = SetWindowsHookExW(WH_MOUSE_LL, AutoPathMouseHook, nullptr, 0);
+
     while (msg.message != WM_QUIT) {
         if (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
             TranslateMessage(&msg);
@@ -1812,11 +1893,17 @@ void RunImGuiApp() {
         HRESULT hr = g_pd3dDevice->Present(nullptr, nullptr, nullptr, nullptr);
         UpdateDoorIdOverlay();
         UpdateAutoPathKeybind();
+        ConsumeAutoPathClicks();
         if (hr == D3DERR_DEVICELOST &&
             g_pd3dDevice->TestCooperativeLevel() == D3DERR_DEVICENOTRESET)
             ResetDevice();
 
         if (!show) break;
+    }
+
+    if (autopath_mouse_hook) {
+        UnhookWindowsHookEx(autopath_mouse_hook);
+        autopath_mouse_hook = nullptr;
     }
 
     ImGui_ImplDX9_Shutdown();

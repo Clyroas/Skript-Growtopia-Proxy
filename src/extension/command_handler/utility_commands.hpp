@@ -3,6 +3,7 @@
 #include "../../core/core.hpp"
 #include <memory>
 #include <atomic>
+#include <cstdint>
 
 
 
@@ -112,6 +113,15 @@ public:
     // Executes the configured walk/teleport action for one target tile. Shared by
     // the click handler and the GUI hover keybind; one action runs at a time.
     static void run_autopath_action(uint32_t tile_x, uint32_t tile_y);
+
+    // Tick count (GetTickCount64 ms) of the last autopath action start, so the
+    // predicted-tile path can tell whether the exact packet already acted.
+    static std::uint64_t last_autopath_action_ms();
+
+    // Full-world targeting: the camera is measured from in-range clicks (exact
+    // tile + mouse position = ground truth) and extrapolated by player movement.
+    static void calibrate_camera(double camera_x, double camera_y, const std::string& world);
+    static bool estimate_camera(double& camera_x, double& camera_y);
 
 private:
     static core::Core* s_core;

@@ -21,6 +21,8 @@
 #include <cctype>
 #ifdef _WIN32
 #include <Windows.h>
+#include <cstring>
+#include <mutex>
 #endif
 
 
@@ -753,6 +755,60 @@ void TeleportCommand::execute(client::Client* client, const std::vector<std::str
 
 namespace {
 std::atomic<bool> g_autopath_running{ false };
+std::atomic<std::uint64_t> g_last_autopath_action_ms{ 0 };
+
+// Measured camera from the most recent in-range click (exact tile + mouse
+// position = ground truth). Predictions extrapolate it by player movement.
+struct CameraCalibration {
+    std::mutex mutex;
+    bool valid = false;
+    std::string world;
+    double camera_x = 0.0;
+    double camera_y = 0.0;
+    double player_x = 0.0;
+    double player_y = 0.0;
+};
+CameraCalibration g_camera_calibration;
+
+static BOOL CALLBACK find_gt_window(HWND hwnd, LPARAM result) {
+    if (!IsWindowVisible(hwnd)) return TRUE;
+    char title[256]{};
+    GetWindowTextA(hwnd, title, static_cast<int>(sizeof(title)));
+    if (std::strstr(title, "Growtopia") != nullptr) {
+        *reinterpret_cast<HWND*>(result) = hwnd;
+        return FALSE;
+    }
+    return TRUE;
+}
+}  // namespace
+
+std::uint64_t TeleportCommand::last_autopath_action_ms() {
+    return g_last_autopath_action_ms.load();
+}
+
+void TeleportCommand::calibrate_camera(double camera_x, double camera_y, const std::string& world) {
+    const auto local = utils::PlayerTracker::get_instance().get_local_player();
+    std::lock_guard<std::mutex> lock(g_camera_calibration.mutex);
+    g_camera_calibration.valid = true;
+    g_camera_calibration.world = world;
+    g_camera_calibration.camera_x = camera_x;
+    g_camera_calibration.camera_y = camera_y;
+    g_camera_calibration.player_x = local.position.x / 32.0;
+    g_camera_calibration.player_y = local.position.y / 32.0;
+}
+
+bool TeleportCommand::estimate_camera(double& camera_x, double& camera_y) {
+    const auto local = utils::PlayerTracker::get_instance().get_local_player();
+    std::lock_guard<std::mutex> lock(g_camera_calibration.mutex);
+    if (!g_camera_calibration.valid ||
+        g_camera_calibration.world != utils::WorldManager::get_instance().get_world_name()) {
+        return false;
+    }
+    // The camera follows the player, so extrapolate by player movement since the
+    // calibration click. The mouse-lean component cannot be extrapolated.
+    camera_x = g_camera_calibration.camera_x + (local.position.x / 32.0 - g_camera_calibration.player_x);
+    camera_y = g_camera_calibration.camera_y + (local.position.y / 32.0 - g_camera_calibration.player_y);
+    return true;
 }
 
 void TeleportCommand::run_autopath_action(uint32_t tile_x, uint32_t tile_y) {
@@ -763,6 +819,7 @@ void TeleportCommand::run_autopath_action(uint32_t tile_x, uint32_t tile_y) {
     if (g_autopath_running.exchange(true)) {
         return;
     }
+    g_last_autopath_action_ms = static_cast<std::uint64_t>(GetTickCount64());
 
     std::thread([core = s_core, tile_x, tile_y]() {
         auto* client = core->get_client();
@@ -806,11 +863,11 @@ void TeleportCommand::run_autopath_action(uint32_t tile_x, uint32_t tile_y) {
 bool TeleportCommand::handle_autopath_click(client::Client* client, uint32_t tile_x, uint32_t tile_y) {
 #ifdef _WIN32
     bool enabled = true;
-    int key = 45;  // VK_INSERT
+    int key = 162;  // VK_LCONTROL
     std::string trigger = "click";
     try {
         enabled = s_core->get_config().get<bool>("command.autopath.enabled", true);
-        key = s_core->get_config().get<int>("command.autopath.key", 45);
+        key = s_core->get_config().get<int>("command.autopath.key", 162);
         trigger = s_core->get_config().get<std::string>("command.autopath.trigger", std::string("click"));
     } catch (...) {}
 
@@ -822,6 +879,28 @@ bool TeleportCommand::handle_autopath_click(client::Client* client, uint32_t til
     if (!key_down) {
         return false;
     }
+
+    // Ground truth for full-world targeting: the game reports this exact tile, and
+    // combined with the mouse position it reveals the real camera origin. Every
+    // in-range click calibrates the predictions used for out-of-range clicks.
+    do {
+        HWND gt = nullptr;
+        EnumWindows(find_gt_window, reinterpret_cast<LPARAM>(&gt));
+        if (!gt) break;
+        POINT mouse{};
+        if (!GetCursorPos(&mouse) || !ScreenToClient(gt, &mouse)) break;
+        RECT client_rect{};
+        if (!GetClientRect(gt, &client_rect)) break;
+        const int w = client_rect.right - client_rect.left;
+        const int h = client_rect.bottom - client_rect.top;
+        if (w <= 0 || h <= 0) break;
+        const double camera_x = static_cast<double>(tile_x) + 0.5
+            - (static_cast<double>(mouse.x) - w * 0.5) / 32.0;
+        const double camera_y = static_cast<double>(tile_y) + 0.5
+            - (static_cast<double>(mouse.y) - h * 0.5) / 32.0;
+        TeleportCommand::calibrate_camera(camera_x, camera_y,
+            utils::WorldManager::get_instance().get_world_name());
+    } while (false);
 
     // The game client already resolved the click to this exact tile. Consume the
     // punch/place packet and move instead.

@@ -18,12 +18,12 @@ static const std::map<std::string, ConfigStorage> config_defaults{
     { "log.printMessage", true },
     { "log.printGameUpdatePacket", false },
     { "log.printVariant", true },
-    // Mouse-aimed autopath: key is a Win32 virtual-key code (45 = VK_INSERT),
+    // Mouse-aimed autopath: key is a Win32 virtual-key code (162 = VK_LCONTROL),
     // mode is "auto" (walk if a path exists, else teleport), "walk" or "teleport";
     // trigger is "click" (hold key + click, exact tile from the game client) or
     // "hover" (press key while hovering, approximate camera-math tile).
     { "command.autopath.enabled", true },
-    { "command.autopath.key", 45 },
+    { "command.autopath.key", 162 },
     { "command.autopath.mode", std::string("auto") },
     { "command.autopath.trigger", std::string("click") },
     { "filter.rate_limit", 300 },

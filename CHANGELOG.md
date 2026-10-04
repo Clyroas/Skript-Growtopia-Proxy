@@ -1,5 +1,31 @@
 # Changelog
 
+## [2.4.2] — Full-world autopath range and Left Ctrl keybind
+
+The click trigger only worked within punch range: the game client simply does not
+emit tile packets for clicks beyond it, so nothing reached the proxy. The keybind
+also moved from Insert to **Left Ctrl** as requested.
+
+### Changed — full-world targeting with a self-calibrating camera
+
+- A system-wide left-click hook (installed while the proxy GUI runs) captures
+  key+clicks anywhere on the Growtopia window, so autopath now works for tiles
+  from one end of the world to the other, not only punch range.
+- Out-of-range clicks have no game-reported tile, so the destination is
+  predicted from a **calibrated camera**: every in-range click hands the proxy a
+  ground truth (exact tile + mouse position = the real camera origin), which is
+  then extrapolated by player movement. The more you use it nearby, the more
+  accurate far clicks become; a fresh world starts from the geometric model
+  until the first calibration click.
+- An out-of-range click waits 150 ms for the exact packet before acting on the
+  prediction, so a target the game can report is never approximated. The
+  prediction never overrides an exact one.
+
+### Changed — keybind
+
+`command.autopath.key` default (and your config.json) changed from 45 (Insert)
+to 162 (Left Ctrl). Any virtual-key code still works.
+
 ## [2.4.1] — Autopath now targets exactly what you click
 
 Hover-based targeting was inaccurate: Growtopia's camera leans toward the mouse
