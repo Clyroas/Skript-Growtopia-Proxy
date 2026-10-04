@@ -23,6 +23,7 @@
 #include "gsbeta_command.hpp"
 #include "inventory_command.hpp"
 #include "dropall_command.hpp"
+#include "pickup_command.hpp"
 #include "autocomp_command.hpp"
 #include "autocollect_command.hpp"
 #include "dropfast_command.hpp"
@@ -132,6 +133,7 @@ public:
         command::BackCommand::set_core(core_);
         command::DropAtCommand::set_core(core_);
         command::FindPathCommand::set_core(core_);
+        command::ScanPathCommand::set_core(core_);
         command::RunCommand::set_core(core_);
         command::PlayerTPCommand::set_core(core_);
         command::FlagCommand::set_core(core_);
@@ -180,6 +182,11 @@ public:
         command::SkinCommand::set_core(core_);
         command::DeathAnimCommand::set_core(core_);
         command::RespawnAnimCommand::set_core(core_);
+        command::QuickRespawnCommand::set_core(core_);
+        command::RandomWorldCommand::set_core(core_);
+        command::SpinAllCommand::set_core(core_);
+        command::FastWheelCommand::set_core(core_);
+        command::PickupCommand::set_core(core_);
         command::ParticleCommand::set_core(core_);
         command::ItemEffectCommand::set_core(core_);
         command::BannerCommand::set_core(core_);
@@ -217,6 +224,7 @@ public:
         register_command(std::make_unique<command::GsBetaCommand>());
         register_command(std::make_unique<command::InventoryCommand>());
         register_command(std::make_unique<command::DropAllCommand>());
+        register_command(std::make_unique<command::PickupCommand>());
         register_command(std::make_unique<command::AutoCompCommand>());
         register_command(std::make_unique<command::AutoCollectCommand>());
         register_command(std::make_unique<command::DropFastCommand>());
@@ -244,6 +252,7 @@ public:
         register_command(std::make_unique<command::BackCommand>());
         register_command(std::make_unique<command::DropAtCommand>());
         register_command(std::make_unique<command::FindPathCommand>());
+        register_command(std::make_unique<command::ScanPathCommand>());
         register_command(std::make_unique<command::PlayerTPCommand>());
         register_command(std::make_unique<command::FlagCommand>());
         register_command(std::make_unique<command::InvisCommand>());
@@ -302,6 +311,10 @@ public:
         register_command(std::make_unique<command::SkinCommand>());
         register_command(std::make_unique<command::DeathAnimCommand>());
         register_command(std::make_unique<command::RespawnAnimCommand>());
+        register_command(std::make_unique<command::QuickRespawnCommand>());
+        register_command(std::make_unique<command::RandomWorldCommand>());
+        register_command(std::make_unique<command::SpinAllCommand>());
+        register_command(std::make_unique<command::FastWheelCommand>());
         register_command(std::make_unique<command::ParticleCommand>());
         register_command(std::make_unique<command::ItemEffectCommand>());
         register_command(std::make_unique<command::BannerCommand>());

@@ -101,7 +101,8 @@ void FindCommand::save_world_vendings(const world_v2::World& world) {
     std::vector<VendingEntry> entries;
     
     for (const auto& tile : world.tiles) {
-        if ((tile.fg == 2978 || tile.fg == 9268) && tile.vending_data.has_data()) {
+        if ((tile.is_vending() || tile.fg == 2978 || tile.fg == 9268) &&
+            tile.vending_data.has_data()) {
             VendingEntry entry;
             entry.world_name = world.name;
             entry.timestamp = timestamp;

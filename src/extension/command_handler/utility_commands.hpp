@@ -2,6 +2,7 @@
 #include "command_base.hpp"
 #include "../../core/core.hpp"
 #include <memory>
+#include <atomic>
 
 
 
@@ -53,6 +54,25 @@ public:
 private:
     static core::Core* s_core;
     static bool s_click_mode_enabled;
+};
+
+class ScanPathCommand : public CommandBase {
+public:
+    ScanPathCommand();
+    void execute(client::Client* client, const std::vector<std::string>& args) override;
+    std::unique_ptr<CommandBase> clone() const override;
+    static void set_core(core::Core* core);
+
+    // Traversal runs on a worker thread; /sp while it runs stops it.
+    static void stop();
+    static bool is_running() { return s_running.load(); }
+
+private:
+    static void run_scanpath(std::uint64_t generation, std::string world_name,
+                             std::vector<std::pair<uint32_t, uint32_t>> markers);
+    static core::Core* s_core;
+    static std::atomic<bool> s_running;
+    static std::atomic<std::uint64_t> s_generation;
 };
 
 class PlayerTPCommand : public CommandBase {
@@ -533,6 +553,46 @@ private:
 class RespawnAnimCommand : public CommandBase {
 public:
     RespawnAnimCommand();
+    void execute(client::Client* client, const std::vector<std::string>& args) override;
+    std::unique_ptr<CommandBase> clone() const override;
+    static void set_core(core::Core* core);
+private:
+    static core::Core* s_core;
+};
+
+class QuickRespawnCommand : public CommandBase {
+public:
+    QuickRespawnCommand();
+    void execute(client::Client* client, const std::vector<std::string>& args) override;
+    std::unique_ptr<CommandBase> clone() const override;
+    static void set_core(core::Core* core);
+private:
+    static core::Core* s_core;
+};
+
+class RandomWorldCommand : public CommandBase {
+public:
+    RandomWorldCommand();
+    void execute(client::Client* client, const std::vector<std::string>& args) override;
+    std::unique_ptr<CommandBase> clone() const override;
+    static void set_core(core::Core* core);
+private:
+    static core::Core* s_core;
+};
+
+class SpinAllCommand : public CommandBase {
+public:
+    SpinAllCommand();
+    void execute(client::Client* client, const std::vector<std::string>& args) override;
+    std::unique_ptr<CommandBase> clone() const override;
+    static void set_core(core::Core* core);
+private:
+    static core::Core* s_core;
+};
+
+class FastWheelCommand : public CommandBase {
+public:
+    FastWheelCommand();
     void execute(client::Client* client, const std::vector<std::string>& args) override;
     std::unique_ptr<CommandBase> clone() const override;
     static void set_core(core::Core* core);

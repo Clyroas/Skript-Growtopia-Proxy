@@ -40,13 +40,17 @@ public:
     }
 
     template <typename T = std::string>
+    void set_runtime(const std::string& key, const T& value)
+    {
+        std::lock_guard<std::mutex> lock(config_mutex_);
+        config_[key] = value;
+    }
+
+    template <typename T = std::string>
     void set(const std::string& key, const T& value)
     {
-        {
-            std::lock_guard<std::mutex> lock(config_mutex_);
-            config_[key] = value;
-        }
-        save(); 
+        set_runtime(key, value);
+        save();
     }
     
     void save(); 

@@ -1124,7 +1124,7 @@ private:
                 int tile_x = static_cast<int>(tank->vec_x / 32.0f);
                 int tile_y = static_cast<int>(tank->vec_y / 32.0f);
                 
-                spdlog::info("[YOUR POSITION] Tile: ({}, {}) | Pixels: ({:.0f}, {:.0f})", 
+                spdlog::trace("[YOUR POSITION] Tile: ({}, {}) | Pixels: ({:.0f}, {:.0f})", 
                             tile_x, tile_y, tank->vec_x, tank->vec_y);
                 
                 
@@ -1149,14 +1149,14 @@ private:
                 auto local_player = tracker.get_local_player();
                 
                 if (local_player.netID > 0 && static_cast<uint32_t>(tank->net_id) != local_player.netID) {
-                    spdlog::debug("[OTHER PLAYER {}] Tile: ({}, {}) | Pixels: ({:.0f}, {:.0f})", 
+                    spdlog::trace("[OTHER PLAYER {}] Tile: ({}, {}) | Pixels: ({:.0f}, {:.0f})", 
                                  tank->net_id, tile_x, tile_y, tank->vec_x, tank->vec_y);
                 }
                 
                 tracker.update_player_position(tank->net_id, tank->vec_x, tank->vec_y);
             } else {
                 
-                spdlog::debug("[STATE PACKET] NetID: {} has no position data (size: {})", 
+                spdlog::trace("[STATE PACKET] NetID: {} has no position data (size: {})", 
                              game_packet.net_id, ext_data.size());
             }
         }
@@ -1192,15 +1192,15 @@ private:
                                     
                                     if (local_player.netID == 0) {
                                         
-                                        spdlog::info("[POSITION DEBUG] Player netID {} at X: {} Y: {} (local player not initialized yet)", 
+                                        spdlog::trace("[POSITION DEBUG] Player netID {} at X: {} Y: {} (local player not initialized yet)", 
                                                     game_packet.net_id, tile_x, tile_y);
                                     } else if (local_player.netID == game_packet.net_id) {
                                         
-                                        spdlog::info("[PLAYER POSITION] X: {} Y: {} (pixels: {:.0f}, {:.0f})", 
+                                        spdlog::trace("[PLAYER POSITION] X: {} Y: {} (pixels: {:.0f}, {:.0f})", 
                                                     tile_x, tile_y, pos.x, pos.y);
                                     } else {
                                         
-                                        spdlog::debug("[OTHER PLAYER {}] X: {} Y: {}", game_packet.net_id, tile_x, tile_y);
+                                        spdlog::trace("[OTHER PLAYER {}] X: {} Y: {}", game_packet.net_id, tile_x, tile_y);
                                     }
                                 }
                             }
@@ -1397,8 +1397,18 @@ private:
                 } catch (...) {}
             }
 
-            spdlog::info("Incoming variant from {}:", event.from == core::EventFrom::FromClient ? "client" : "server");
+            const bool is_position_update = !variants.empty()
+                && packet::Variant::get_type(variants.front()) == packet::VariantType::STRING
+                && std::get<std::string>(variants.front()) == "OnSetPos";
+            if (!is_position_update) {
+                spdlog::info("Incoming variant from {}:", event.from == core::EventFrom::FromClient ? "client" : "server");
+            }
             for (size_t i = 0; i < variants.size(); ++i) {
+                // OnSetPos arrives repeatedly for every moving player. Its values are
+                // already tracked above; omit the per-field diagnostic spam here.
+                if (is_position_update) {
+                    break;
+                }
                 try {
                     switch (packet::Variant::get_type(variants[i])) {
                     case packet::VariantType::FLOAT:
@@ -1415,14 +1425,14 @@ private:
                         try {
                             TextParse text_parse{ str_val };
                             if (!text_parse.empty()) {
-                                std::vector key_values{ text_parse.get_key_values() };
+                                std::vector key_values{ text_parse.get_redacted_key_values() };
                                 if (key_values.size() == 1) {
                                     spdlog::info("[SERVER] {}", key_values[0]);
                                     break;
                                 }
 
                                 spdlog::info("[SERVER]");
-                                for (const auto& key_value : text_parse.get_key_values()) {
+                                for (const auto& key_value : text_parse.get_redacted_key_values()) {
                                     spdlog::info("{}", key_value);
                                 }
                                 break;
@@ -1439,7 +1449,9 @@ private:
                     case packet::VariantType::VEC2:
                         {
                             const glm::vec2 vec2{ std::get<glm::vec2>(variants[i]) };
-                            spdlog::info("[POSITION] X: {}, Y: {}", vec2.x, vec2.y);
+                            if (!is_position_update) {
+                                spdlog::info("[POSITION] X: {}, Y: {}", vec2.x, vec2.y);
+                            }
                             
                             
                             if (variant.size() > 0) {

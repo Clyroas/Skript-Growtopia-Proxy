@@ -1,8 +1,13 @@
 #pragma once
 #include <ranges>
 #include <string>
+#include <utility>
 #include <vector>
 #include <unordered_map>
+#include <algorithm>
+#include <array>
+#include <cctype>
+#include <string_view>
 
 class TextParse {
 public:
@@ -135,6 +140,36 @@ public:
             key_values.emplace_back(key_value);
         }
 
+        return key_values;
+    }
+
+    [[nodiscard]] std::vector<std::string> get_redacted_key_values(const std::string& delimiter = "|") const
+    {
+        static constexpr std::array<std::string_view, 17> sensitive_keys{
+            "tankidname", "tankidpass", "password", "passwd", "pass",
+            "token", "ltoken", "access_token", "refresh_token", "mac",
+            "clienttoken", "uuidtoken", "uuid_token", "rid", "hash", "hash2", "wk"
+        };
+
+        std::vector<std::string> key_values{};
+        key_values.reserve(data_.size());
+        for (const auto& [key, values] : data_) {
+            std::string normalized_key{ key };
+            std::ranges::transform(normalized_key, normalized_key.begin(), [](unsigned char ch) {
+                return static_cast<char>(std::tolower(ch));
+            });
+
+            std::string key_value{ key };
+            if (std::ranges::find(sensitive_keys, std::string_view{ normalized_key }) != sensitive_keys.end()) {
+                key_value += delimiter + "[REDACTED]";
+            }
+            else {
+                for (const auto& value : values) {
+                    key_value += delimiter + value;
+                }
+            }
+            key_values.emplace_back(std::move(key_value));
+        }
         return key_values;
     }
 

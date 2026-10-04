@@ -9,6 +9,8 @@
 
 #include "client.hpp"
 #include "../utils/strenc.hpp"
+#include "../utils/packet_limits.hpp"
+#include "../utils/enet_lock.hpp"
 #include "../packet/packet_helper.hpp"
 #include "../packet/message/core.hpp"
 #include "../packet/packet_variant.hpp"
@@ -60,7 +62,10 @@ Client::Client(core::Core* core)
     : core_{ core }
     , player_{ nullptr }
 {
-    host_ = enet_host_create(nullptr, 1, 2, 0, 0);
+    // 8 slots instead of 1: a reconnect before the old upstream peer has timed out
+    // (sub-server switch, world change) would otherwise be refused for lack of a slot.
+    constexpr std::size_t kPeerSlots = 8;
+    host_ = enet_host_create(nullptr, kPeerSlots, 2, 0, 0);
     if (!host_) {
         return;
     }
@@ -80,15 +85,9 @@ Client::Client(core::Core* core)
                 return;
             }
 
-            
-            if (const auto ext{ core_->get_extension(0x153bd697) }; ext) {
-                return;
-            }
-
             const core::Config& config{ core_->get_config() };
             player::Player* local = core_->get_server()->get_player();
 
-            
             auto send_console = [&](const std::string& msg) {
                 if (!local) return;
                 packet::Variant var{};
@@ -107,14 +106,24 @@ Client::Client(core::Core* core)
                 local->send_packet(bs.get_data(), 0);
             };
 
-            
-            bool proxy_enabled = config.get<bool>("proxy.enabled");
-            if (proxy_enabled) {
-                std::string proxy_host = config.get<std::string>("proxy.host");
-                uint16_t    proxy_port = static_cast<uint16_t>(
-                                            config.get<unsigned int>("proxy.port"));
-                std::string proxy_user = config.get<std::string>("proxy.username");
-                std::string proxy_pass = config.get<std::string>("proxy.password");
+            // SOCKS5 must be set up BEFORE any early return below.
+            //
+            // This block used to sit after `if (get_extension(0x153bd697)) return;`,
+            // and IWebServerExtension carries exactly that UID and is registered
+            // unconditionally in main.cpp, so the guard always fired and this code was
+            // unreachable. ENet's relay in lib/enet/win32.c only engages when
+            // g_socks5_active is set, which only happens here, so enabling proxy.enabled
+            // silently did nothing and all traffic left on the real IP.
+            //
+            // The tunnel is a process-wide switch consumed by ENet's send path, so it
+            // must be established whenever a client connection comes up, regardless of
+            // which listener goes on to create the upstream peer.
+            if (config.get<bool>("proxy.enabled")) {
+                const std::string proxy_host = config.get<std::string>("proxy.host");
+                const uint16_t    proxy_port = static_cast<uint16_t>(
+                                                    config.get<unsigned int>("proxy.port"));
+                const std::string proxy_user = config.get<std::string>("proxy.username");
+                const std::string proxy_pass = config.get<std::string>("proxy.password");
 
                 send_console("`5[SOCKS5]`` Connecting to proxy " + proxy_host
                              + ":" + std::to_string(proxy_port) + "...");
@@ -122,16 +131,25 @@ Client::Client(core::Core* core)
 
                 try {
                     socks5_tunnel::connect(proxy_host, proxy_port, proxy_user, proxy_pass);
-                    send_console("`2[SOCKS5]`` Tunnel established — connecting to GT server...");
-                    spdlog::info("[SOCKS5] Tunnel established successfully");
+                    send_console("`2[SOCKS5]`` Tunnel established — relaying game traffic via UDP ASSOCIATE");
+                    spdlog::info("[SOCKS5] Tunnel established, g_socks5_active set");
                 } catch (const std::exception& e) {
-                    send_console(std::string("`4[SOCKS5]`` Tunnel failed: ") + e.what());
+                    // Leave g_socks5_active at 0 so ENet falls back to a direct send
+                    // rather than blackholing traffic at a relay that never answered.
+                    send_console(std::string("`4[SOCKS5]`` Tunnel failed: ") + e.what()
+                                 + " (falling back to a direct connection)");
                     spdlog::error("[SOCKS5] Tunnel failed: {}", e.what());
-                    
                 }
-            } else {
-                
-                if (socks5_tunnel::is_active()) socks5_tunnel::disconnect();
+            } else if (socks5_tunnel::is_active()) {
+                socks5_tunnel::disconnect();
+                spdlog::info("[SOCKS5] Tunnel closed (proxy.enabled is false)");
+            }
+
+            // When the HTTPS extension is present it owns the upstream connection:
+            // its own Connection listener connects to the server_data.php target, and
+            // cancels this event, so nothing below should run.
+            if (const auto ext{ core_->get_extension(0x153bd697) }; ext) {
+                return;
             }
 
             std::ignore = connect(
@@ -153,14 +171,34 @@ Client::~Client()
 ENetPeer* Client::connect(const std::string& host, const enet_uint16 port) const
 {
     if (!host_) {
+        spdlog::error("[ENET] connect('{}', {}) but the upstream host is null", host, port);
         return nullptr;
     }
 
     ENetAddress address{};
-    enet_address_set_host(&address, host.c_str());
+    // enet_address_set_host returns < 0 when the name cannot be resolved. Every caller
+    // used to ignore this, which silently left address.host = 0 (0.0.0.0) and produced a
+    // connection that could never complete.
+    if (enet_address_set_host(&address, host.c_str()) < 0) {
+        spdlog::error("[ENET] Could not resolve upstream host '{}'", host);
+        return nullptr;
+    }
     address.port = port;
 
-    return enet_host_connect(host_, &address, 2, 0);
+    const net::ENetLock guard{ net::enet_traffic_mutex() };
+
+    ENetPeer* peer{ enet_host_connect(host_, &address, 2, 0) };
+    if (!peer) {
+        // Returns NULL when no peer slot is free (or on failure). Ignored at every call
+        // site before, which left the client attached with no upstream link.
+        spdlog::error("[ENET] enet_host_connect failed for '{}' -> {}:{} (no free peer slot?)",
+                      host, network::format_ip_address(address.host), port);
+        return nullptr;
+    }
+
+    spdlog::info("[ENET] connecting upstream to '{}' -> {}:{} (peer slots in use on this host)",
+                 host, network::format_ip_address(address.host), port);
+    return peer;
 }
 
 void Client::process()
@@ -182,20 +220,46 @@ void Client::process()
     }
 
     ENetEvent ev{};
-    while (enet_host_service(host_, &ev, 16) > 0) {
-        switch (ev.type) {
-        case ENET_EVENT_TYPE_CONNECT:
-            on_connect(ev.peer);
-            break;
-        case ENET_EVENT_TYPE_DISCONNECT:
-            on_disconnect(ev.peer);
-            break;
-        case ENET_EVENT_TYPE_RECEIVE:
-            on_receive(ev.peer, ev.packet);
-            break;
-        default:
-            break;
+    // Poll without waiting so the other host is serviced promptly by Core::run().
+    // Bound each pass: a continuously busy upstream must not starve the local-client
+    // host, whose ACKs and keepalives are serviced by the next Core::run() iteration.
+    constexpr std::size_t kMaxEventsPerPass = 128;
+    {
+        const net::ENetLock guard{ net::enet_traffic_mutex() };
+
+        std::size_t events_processed = 0;
+        while (events_processed < kMaxEventsPerPass && enet_host_service(host_, &ev, 0) > 0) {
+            ++events_processed;
+            switch (ev.type) {
+            case ENET_EVENT_TYPE_CONNECT:
+                on_connect(ev.peer);
+                break;
+            case ENET_EVENT_TYPE_DISCONNECT:
+                // ENet calls enet_peer_reset() and forces event->data = 0 before this
+                // event is returned, so ev.data is always 0 here. Log what is still
+                // readable so a failed handshake can be told apart from a mid-session
+                // timeout. state will be DISCONNECTED because of that reset.
+                spdlog::warn("[ENET] upstream DISCONNECT event: peer={}:{} state={} (data={})",
+                             network::format_ip_address(ev.peer->address.host),
+                             ev.peer->address.port,
+                             static_cast<int>(ev.peer->state),
+                             static_cast<unsigned>(ev.data));
+                on_disconnect(ev.peer);
+                break;
+            case ENET_EVENT_TYPE_RECEIVE:
+                spdlog::trace("[ENET] upstream received {} bytes", ev.packet->dataLength);
+                on_receive(ev.peer, ev.packet);
+                break;
+            default:
+                break;
+            }
         }
+
+        // enet_peer_send() only queues; without this the upstream socket is not written
+        // until the next service call, batching outbound traffic by up to the 16 ms
+        // timeout above. Reliable packets are ACKed from the peer's inbound path, so
+        // delaying them adds round-trip time and eats into ENet's timeout budget.
+        enet_host_flush(host_);
     }
 }
 
@@ -207,6 +271,24 @@ void Client::on_connect(ENetPeer* peer)
         network::format_ip_address(peer->address.host),
         peer->address.port
     );
+
+    // The upstream peer used to keep ENet's defaults (limit 32, min 5000 ms, max 30000 ms),
+    // which is stricter than the client-facing peer and left no headroom for the proxy's
+    // own parsing and logging work. Match the client-facing settings so a brief stall on
+    // either side does not tear the session down.
+    enet_peer_timeout(peer, 10000, 15000, 20000);
+
+    // Same reasoning as Server::on_connect: retire any previous upstream peer explicitly
+    // so it cannot linger in the host's peer array and deliver stale data or keep
+    // consuming bandwidth once its session has been replaced.
+    if (player_) {
+        if (ENetPeer* old_peer = player_->get_peer(); old_peer != nullptr && old_peer != peer) {
+            spdlog::warn("Upstream reconnect: retiring previous server peer");
+            enet_peer_disconnect_now(old_peer, 0);
+        }
+        delete player_;
+        player_ = nullptr;
+    }
 
     player_ = new player::Player{ peer };
 
@@ -228,19 +310,28 @@ void Client::on_receive(ENetPeer* peer, ENetPacket* packet)
         return;
     }
 
+    // Ignore data from a superseded upstream peer (see on_connect): relaying it would
+    // mix a dead server session into the live client.
+    if (player_->get_peer() != peer) {
+        spdlog::debug("Dropping packet from a superseded upstream peer");
+        enet_packet_destroy(packet);
+        return;
+    }
+
     ByteStream<std::uint16_t> byte_stream{ reinterpret_cast<std::byte*>(packet->data), packet->dataLength };
     
     
-    constexpr std::size_t kMaxIncomingPacketSize = 8 * 1024 * 1024; 
-    if (byte_stream.get_size() < 4 || byte_stream.get_size() > kMaxIncomingPacketSize) {
-        spdlog::warn("Incoming packet size out of bounds: {} bytes", byte_stream.get_size());
-        if (byte_stream.get_size() > kMaxIncomingPacketSize) {
-            
-            enet_packet_destroy(packet);
-            return;
-        }
+    // Shared ceiling (32 MiB, ENet's own maximum packet size). This used to be 8 MiB,
+    // which dropped large world and item-database packets before they were forwarded.
+    constexpr std::size_t kMaxIncomingPacketSize = packet::kMaxPacketSize;
+    if (byte_stream.get_size() < packet::kMinPacketSize || byte_stream.get_size() > kMaxIncomingPacketSize) {
+        // Oversized packets are dropped, and undersized ones are dropped too. A single
+        // malformed or empty datagram used to tear the whole session down here, which is
+        // far more destructive than the corrupt packet itself: one stray packet produced
+        // an apparently random disconnect. Drop it and keep the session alive.
+        spdlog::warn("Dropping out-of-bounds incoming packet: {} bytes (bounds {}..{})",
+                     byte_stream.get_size(), packet::kMinPacketSize, kMaxIncomingPacketSize);
         enet_packet_destroy(packet);
-        player_->disconnect();
         return;
     }
 
@@ -248,7 +339,9 @@ void Client::on_receive(ENetPeer* peer, ENetPacket* packet)
 
     packet::NetMessageType type{};
     if (!byte_stream.read(type)) {
-        player_->disconnect();
+        // Same reasoning: a header we cannot parse is not a reason to disconnect.
+        spdlog::warn("Dropping incoming packet with unreadable message type ({} bytes)",
+                     byte_stream.get_size());
         return;
     }
 
@@ -317,7 +410,10 @@ void Client::handle_server_hello(ByteStream<std::uint16_t>& byte_stream, player:
 void Client::handle_text_message(ByteStream<std::uint16_t>& byte_stream, player::Player* to_player, ENetPeer* peer)
 {
     std::string message{};
-    byte_stream.read(message, byte_stream.get_size() - sizeof(packet::NetMessageType) - 1);
+    // Read every remaining byte. This previously subtracted 1 as well, silently dropping
+    // the last character of the message; the message type was already consumed by the
+    // caller, so get_remaining() is the exact payload length.
+    byte_stream.read(message, byte_stream.get_remaining());
 
     TextParse text_parse{ message };
 
@@ -340,7 +436,7 @@ void Client::handle_text_message(ByteStream<std::uint16_t>& byte_stream, player:
 
     if (core_->get_config().get<bool>("log.printMessage")) {
         spdlog::info("Received server message:");
-        for (const auto& key_value : text_parse.get_key_values()) {
+        for (const auto& key_value : text_parse.get_redacted_key_values()) {
             spdlog::info("  {}", key_value);
         }
     }
@@ -565,7 +661,25 @@ void Client::handle_game_packet(ByteStream<std::uint16_t>& byte_stream, player::
                                 std::string modified_data = spawn_data;
                                 auto replace_or_add_field = [](std::string& data, const std::string& field, const std::string& value) {
                                     std::string search_pattern = field + "|";
-                                    size_t pos = data.find(search_pattern);
+                                    
+                                    
+                                    
+                                    size_t pos = std::string::npos;
+                                    size_t search_from = 0;
+                                    while (true) {
+                                        const size_t candidate = data.find(search_pattern, search_from);
+                                        if (candidate == std::string::npos) {
+                                            break;
+                                        }
+                                        
+                                        const bool at_line_start = candidate == 0 || data[candidate - 1] == '\n';
+                                        if (at_line_start) {
+                                            pos = candidate;
+                                            break;
+                                        }
+                                        search_from = candidate + 1;
+                                    }
+                                    
                                     if (pos != std::string::npos) {
                                         size_t value_start = pos + search_pattern.length();
                                         size_t value_end = data.find('\n', value_start);
@@ -576,7 +690,14 @@ void Client::handle_game_packet(ByteStream<std::uint16_t>& byte_stream, player::
                                     } else {
                                         size_t type_pos = data.find("type|local");
                                         if (type_pos != std::string::npos) {
-                                            data.insert(type_pos, field + "|" + value + "\n");
+                                            
+                                            
+                                            
+                                            const size_t line_end = data.find('\n', type_pos);
+                                            const size_t insert_at = line_end == std::string::npos
+                                                ? data.length()
+                                                : line_end + 1;
+                                            data.insert(insert_at, field + "|" + value + "\n");
                                         }
                                     }
                                 };
@@ -749,7 +870,10 @@ void Client::on_disconnect(ENetPeer* peer)
     
     send_connection_error_msg(const_cast<player::Player*>(to_player));
 
-    enet_host_flush(host_);
+    {
+        const net::ENetLock guard{ net::enet_traffic_mutex() };
+        enet_host_flush(host_);
+    }
     to_player->disconnect_now();
     core_->get_server()->on_disconnect(to_player->get_peer());
 }

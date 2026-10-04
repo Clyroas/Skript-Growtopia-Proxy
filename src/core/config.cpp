@@ -7,10 +7,12 @@
 
 namespace core {
 static const std::map<std::string, ConfigStorage> config_defaults{
-    { "server.port", 16999 },
+    { "server.port", static_cast<unsigned int>(17091) },
     { "server.address", "www.growtopia1.com" },
-    { "client.game_version", "5.21" },
-    { "client.protocol", 312 },
+    { "client.game_version", "auto" },
+    { "client.protocol", static_cast<unsigned int>(0) },
+    { "client.version_override", std::string("") },
+    { "client.protocol_override", static_cast<unsigned int>(0) },
     { "client.dnsServer", "cloudflare" },
     { "extension.ignore", std::vector<std::string>{ "0xdeadbeef" } },
     { "log.printMessage", true },

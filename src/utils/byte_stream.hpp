@@ -19,6 +19,15 @@ public:
 
     }
 
+    // Added so callers can construct from get_data().data(), which is const. The
+    // buffer is copied, never written through, so a const source is sufficient.
+    ByteStream(const std::byte* data, const std::size_t length)
+        : data_{ std::vector(data, data + length) }
+        , read_offset_{ 0 }
+    {
+
+    }
+
     void write_data(const void* ptr, const std::size_t size)
     {
         const auto begin{ static_cast<const std::byte*>(ptr) };
@@ -64,7 +73,9 @@ public:
 
     bool read_data(void* ptr, const std::size_t size)
     {
-        if (data_.size() - read_offset_ < size) {
+        // get_remaining() avoids the unsigned underflow that a bare
+        // `data_.size() - read_offset_` would produce if the offset ever passed the end.
+        if (get_remaining() < size) {
             return false;
         }
 
@@ -84,7 +95,7 @@ public:
             }
         }
 
-        if (data_.size() - read_offset_ < static_cast<std::size_t>(length)) {
+        if (get_remaining() < static_cast<std::size_t>(length)) {
             return false;
         }
 
@@ -95,7 +106,7 @@ public:
     
     bool read_vector(std::vector<std::byte>& vec, std::size_t length)
     {
-        if (data_.size() - read_offset_ < length) {
+        if (get_remaining() < length) {
             return false;
         }
         vec.resize(length);
@@ -117,7 +128,7 @@ public:
             }
         }
 
-        if (data_.size() - read_offset_ < static_cast<std::size_t>(length)) {
+        if (get_remaining() < static_cast<std::size_t>(length)) {
             return false;
         }
 
@@ -127,7 +138,7 @@ public:
 
     bool read(std::string& str, std::size_t length)
     {
-        if (data_.size() - read_offset_ < length) {
+        if (get_remaining() < length) {
             return false;
         }
         str.resize(length);
@@ -141,10 +152,40 @@ public:
         return *this;
     }
 
-    void skip(const std::size_t size) { read_offset_ += size; }
+    // Advances the read offset by `size` bytes (relative), clamped to the end of the
+    // buffer so the offset can never pass it. Callers that want an absolute position
+    // should use seek().
+    void skip(const std::size_t size)
+    {
+        if (size >= data_.size() - read_offset_) {
+            read_offset_ = data_.size();
+            return;
+        }
+        read_offset_ += size;
+    }
+
+    // Sets the read offset to an absolute position, clamped to the buffer size.
+    void seek(const std::size_t offset)
+    {
+        read_offset_ = offset > data_.size() ? data_.size() : offset;
+    }
+
     [[nodiscard]] std::size_t get_read_offset() const { return read_offset_; }
     [[nodiscard]] std::size_t get_size() const { return data_.size(); }
-    [[nodiscard]] std::vector<std::byte> get_data() const { return data_; }
+
+    // Returns a reference: this used to return std::vector by value, which copied the
+    // entire buffer on every call. The relay path calls it several times per packet
+    // (including multi-hundred-KB map packets), so the copies were pure overhead and a
+    // source of allocation stalls on the ENet service thread.
+    [[nodiscard]] const std::vector<std::byte>& get_data() const { return data_; }
+
+    [[nodiscard]] const std::byte* data() const { return data_.data(); }
+
+    // Bytes still available to read after the current read offset.
+    [[nodiscard]] std::size_t get_remaining() const
+    {
+        return read_offset_ < data_.size() ? data_.size() - read_offset_ : 0;
+    }
 
 private:
     std::vector<std::byte> data_;

@@ -81,6 +81,7 @@ void ProxyCommand::show_commands_gui(player::Player* player, core::Core* core) {
 
         dialog << "add_textbox|`2/warp`` `9[world]``|left|\n";
         dialog << "add_textbox|`2/back`` - `9Warp to previous world|left|\n";
+        dialog << "add_textbox|`2/rndm`` - `9Warp to a recently visited world|left|\n";
         dialog << "add_textbox|`2/exit`` - `9Exit world|left|\n";
         dialog << "add_textbox|`2/join`` `9 - Open join mode GUI [autoban/pull/kick]|left|\n";
         dialog << "add_textbox|`2/growscan`` - Scan world for items|left|\n";
@@ -125,6 +126,7 @@ void ProxyCommand::show_commands_gui(player::Player* player, core::Core* core) {
         dialog << "add_textbox|`6/find`` `9[item]`` - Find items in world|left|\n";
         dialog << "add_textbox|`6/dropfast`` - Fast drop items|left|\n";
         dialog << "add_textbox|`6/dropall`` - Drop all items|left|\n";
+        dialog << "add_textbox|`6/pickup [item_id]`` - Pick up the nearest dropped stack of that item|left|\n";
         dialog << "add_textbox|`6/trashfast`` - Fast trash items|left|\n";
         dialog << "add_textbox|`6/bankadd`` `9[amount]`` - Deposit to world lock bank|left|\n";
         dialog << "add_textbox|`6/bankwith`` `9[amount]`` - Withdraw from world lock bank|left|\n";
@@ -190,6 +192,9 @@ void ProxyCommand::show_commands_gui(player::Player* player, core::Core* core) {
         dialog << "add_textbox|`1/dat`` - Reveal ext tiles data|left|\n";
         dialog << "add_textbox|`1/freeze`` - Freeze client (fake DC)|left|\n";
         dialog << "add_textbox|`1/ping`` - Display GT server ping|left|\n";
+        dialog << "add_textbox|`1/res`` - Request an immediate respawn|left|\n";
+        dialog << "add_textbox|`1/spinall`` - Toggle QQ + REME annotations for wheel results|left|\n";
+        dialog << "add_textbox|`1/fastwheel`` - Toggle instant display for wheel results|left|\n";
         dialog << "add_textbox|`1/lockefind`` - Search for locke|left|\n";
         dialog << "add_spacer|small|\n";
         

@@ -55,7 +55,9 @@ void PlayerTracker::update_player_position(uint32_t netID, float x, float y) {
         
         if (it->second.position != new_position) {
             it->second.position = new_position;
-            spdlog::debug("Player {} position updated: X={}, Y={}", netID, x, y);
+            // Movement can arrive many times per second for every player in a busy
+            // world. Keep this diagnostic out of the normal console, file, and GUI logs.
+            spdlog::trace("Player {} position updated: X={}, Y={}", netID, x, y);
         }
     } else {
         
@@ -64,7 +66,7 @@ void PlayerTracker::update_player_position(uint32_t netID, float x, float y) {
         info.name = fmt::format("Player_{}", netID); 
         info.position = PlayerPosition(x, y);
         players_[netID] = info;
-        spdlog::debug("Auto-tracked player {} at position X={}, Y={}", netID, x, y);
+        spdlog::trace("Auto-tracked player {} at position X={}, Y={}", netID, x, y);
     }
 }
 

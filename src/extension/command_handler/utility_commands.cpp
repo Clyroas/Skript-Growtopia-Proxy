@@ -17,6 +17,8 @@
 #include <chrono>
 #include <cmath>
 #include <algorithm>
+#include <random>
+#include <cctype>
 #ifdef _WIN32
 #include <Windows.h>
 #endif
@@ -52,6 +54,9 @@ static_assert(sizeof(MoriStatePacket) == 56, "MoriStatePacket must be 56 bytes")
 
 core::Core* FindPathCommand::s_core = nullptr;
 bool FindPathCommand::s_click_mode_enabled = false;
+core::Core* ScanPathCommand::s_core = nullptr;
+std::atomic<bool> ScanPathCommand::s_running{ false };
+std::atomic<std::uint64_t> ScanPathCommand::s_generation{ 0 };
 core::Core* PlayerTPCommand::s_core = nullptr;
 core::Core* FlagCommand::s_core = nullptr;
 core::Core* InvisCommand::s_core = nullptr;
@@ -65,6 +70,10 @@ bool BetaCommand::s_beta_enabled = false;
 core::Core* FreezeCommand::s_core = nullptr;
 core::Core* AntiGravityCommand::s_core = nullptr;
 core::Core* AntiPunchCommand::s_core = nullptr;
+core::Core* QuickRespawnCommand::s_core = nullptr;
+core::Core* RandomWorldCommand::s_core = nullptr;
+core::Core* SpinAllCommand::s_core = nullptr;
+core::Core* FastWheelCommand::s_core = nullptr;
 
 void send_console(player::Player* player, const std::string& msg) {
     if (!player) return;
@@ -135,6 +144,136 @@ void FindPathCommand::set_core(core::Core* core) {
     s_core = core;
 }
 
+ScanPathCommand::ScanPathCommand() : CommandBase(
+    {"scanpath", "sp"},
+    {"[scan]"},
+    "Scan Path Marker tiles (item 1684); /sp traverses them in map order, /sp again stops.",
+    0
+) {}
+
+std::unique_ptr<CommandBase> ScanPathCommand::clone() const {
+    return std::make_unique<ScanPathCommand>(*this);
+}
+
+void ScanPathCommand::set_core(core::Core* core) {
+    s_core = core;
+}
+
+void ScanPathCommand::stop() {
+    s_running = false;
+    s_generation.fetch_add(1);
+}
+
+void ScanPathCommand::execute(client::Client* client, const std::vector<std::string>& args) {
+    if (!s_core || !client || !client->get_player()) return;
+    auto* server = s_core->get_server();
+    if (!server || !server->get_player()) return;
+
+    if (s_running.load()) {
+        stop();
+        send_console(server->get_player(), "`4Scanpath stopped.");
+        return;
+    }
+
+    auto& wm = utils::WorldManager::get_instance();
+    if (!wm.has_world()) {
+        send_console(server->get_player(), "`4No world data loaded. Enter a world and try again.");
+        return;
+    }
+
+    const uint32_t width = wm.get_world_width();
+    const uint32_t height = wm.get_world_height();
+    const auto tiles = wm.get_tiles_snapshot();
+    if (width == 0 || height == 0 || tiles.size() < static_cast<size_t>(width) * height) {
+        send_console(server->get_player(), "`4World tile data is incomplete; move around and rescan.");
+        return;
+    }
+
+    constexpr uint16_t kPathMarkerItemId = 1684;
+    constexpr uint16_t kObjectiveMarkerItemId = 4482;
+    std::vector<std::pair<uint32_t, uint32_t>> markers;
+    std::vector<std::pair<uint32_t, uint32_t>> objectives;
+    for (uint32_t y = 0; y < height; ++y) {
+        for (uint32_t x = 0; x < width; ++x) {
+            const auto& tile = tiles[static_cast<size_t>(y) * width + x];
+            if (tile.Fg == kPathMarkerItemId) markers.emplace_back(x, y);
+            else if (tile.Fg == kObjectiveMarkerItemId) objectives.emplace_back(x, y);
+        }
+    }
+
+    if (markers.empty() && objectives.empty()) {
+        send_console(server->get_player(),
+            "`4No Path Marker (ID 1684) or Objective Marker (ID 4482) tiles found in this world.");
+        return;
+    }
+
+    if (args.size() > 1 && (args[1] == "scan" || args[1] == "list")) {
+        send_console(server->get_player(), fmt::format("`2Found {} Path Marker(s) in map order:", markers.size()));
+        for (size_t i = 0; i < markers.size(); ++i) {
+            send_console(server->get_player(), fmt::format("`o{}: `w({}, {})", i + 1, markers[i].first, markers[i].second));
+        }
+        send_console(server->get_player(), fmt::format("`2Found {} Objective Marker(s):", objectives.size()));
+        for (size_t i = 0; i < objectives.size(); ++i) {
+            send_console(server->get_player(), fmt::format("`o{}: `w({}, {})", i + 1, objectives[i].first, objectives[i].second));
+        }
+        send_console(server->get_player(), "`oRun /sp to traverse the Path Markers; /sp again to stop.");
+        return;
+    }
+
+    if (markers.empty()) {
+        send_console(server->get_player(), "`4No Path Marker tiles to traverse. Use /sp scan to list Objective Markers.");
+        return;
+    }
+
+    s_running = true;
+    const uint64_t gen = ++s_generation;
+    const std::string world_name = wm.get_world_name();
+    send_console(server->get_player(),
+        fmt::format("`2Traversing {} Path Marker(s) in map order. Run /sp again to stop.", markers.size()));
+    std::thread([gen, world_name, markers = std::move(markers)]() mutable {
+        run_scanpath(gen, std::move(world_name), std::move(markers));
+    }).detach();
+}
+
+void ScanPathCommand::run_scanpath(std::uint64_t generation, std::string world_name,
+                                   std::vector<std::pair<uint32_t, uint32_t>> markers) {
+    size_t reached = 0;
+    for (const auto& marker : markers) {
+        if (!s_running.load() || generation != s_generation.load()) return;
+
+        auto* server = s_core ? s_core->get_server() : nullptr;
+        auto* client = s_core ? s_core->get_client() : nullptr;
+        if (!server || !server->get_player() || !client) return;
+
+        if (utils::WorldManager::get_instance().get_world_name() != world_name) {
+            send_console(server->get_player(), "`4World changed; scanpath traversal stopped.");
+            return;
+        }
+
+        send_console(server->get_player(),
+            fmt::format("`oPath Marker {} of {} at ({}, {}).", reached + 1, markers.size(),
+                marker.first, marker.second));
+        const int steps = FindPathCommand::run_path(client, marker.first, marker.second, false, 55);
+        if (steps <= 0) {
+            send_console(server->get_player(),
+                fmt::format("`4Could not reach marker at ({}, {}). Stopping.", marker.first, marker.second));
+            break;
+        }
+        ++reached;
+    }
+
+    if (generation == s_generation.load()) {
+        s_running = false;
+    }
+    if (reached == markers.size() && generation == s_generation.load()) {
+        auto* server = s_core ? s_core->get_server() : nullptr;
+        if (server && server->get_player()) {
+            send_console(server->get_player(),
+                fmt::format("`2Scanpath complete: reached all {} marker(s).", reached));
+        }
+    }
+}
+
 bool FindPathCommand::is_click_mode_enabled() {
     return s_click_mode_enabled; 
 }
@@ -169,6 +308,16 @@ int FindPathCommand::run_path(client::Client* client, uint32_t target_x, uint32_
         if (show_console) send_console(server->get_player(), "`4Failed to parse position");
         return -1;
     }
+
+    // Prefer the live tracker position to the saved config value. The latter
+    // can lag behind after movement and produce a disconnected A* start tile.
+    const auto tracked_player = utils::PlayerTracker::get_instance().get_local_player();
+    if (tracked_player.netID != 0 && std::isfinite(tracked_player.position.x) &&
+        std::isfinite(tracked_player.position.y) && tracked_player.position.x >= 0.0f &&
+        tracked_player.position.y >= 0.0f) {
+        pos_x = tracked_player.position.x;
+        pos_y = tracked_player.position.y;
+    }
     
     uint32_t current_x = static_cast<uint32_t>(pos_x / 32.0f);
     uint32_t current_y = static_cast<uint32_t>(pos_y / 32.0f);
@@ -196,7 +345,7 @@ int FindPathCommand::run_path(client::Client* client, uint32_t target_x, uint32_
     
     
     
-    const auto& tiles = world_manager.get_tiles();
+    const auto tiles = world_manager.get_tiles_snapshot();
     if (tiles.empty() || tiles.size() < static_cast<size_t>(WORLD_WIDTH) * WORLD_HEIGHT) {
         
         
@@ -210,7 +359,10 @@ int FindPathCommand::run_path(client::Client* client, uint32_t target_x, uint32_
     for (size_t i = 0; i < collision_data.size(); ++i) {
         
         const auto& t = tiles[i];
-        collision_data[i] = (t.Fg != 0 || t.Bg != 0) ? 1 : 0;
+        // Background tiles are decorative and do not stop movement. Treating
+        // them as solid can split otherwise open areas and make nearby markers
+        // appear unreachable.
+        collision_data[i] = t.Fg != 0 ? 1 : 0;
     }
 
     
@@ -3198,6 +3350,106 @@ void RespawnAnimCommand::execute(client::Client* client, const std::vector<std::
     server->get_player()->send_packet(bs.get_data(),0);
     send_console(server->get_player(), fmt::format("`0[ `bSkriptProxy `0] `9Respawn anim: `b{}", id));
     spdlog::info("OnChangeRespawnAnim: id={} netID={}", id, lp.netID);
+}
+
+QuickRespawnCommand::QuickRespawnCommand()
+    : CommandBase({"res", "respawn"}, {}, "Request an immediate respawn", 0) {}
+std::unique_ptr<CommandBase> QuickRespawnCommand::clone() const {
+    return std::make_unique<QuickRespawnCommand>();
+}
+void QuickRespawnCommand::set_core(core::Core* core) { s_core = core; }
+void QuickRespawnCommand::execute(client::Client* client, const std::vector<std::string>&) {
+    if (!s_core || !client || !client->get_player()) return;
+    auto* server = s_core->get_server();
+    if (!server || !server->get_player()) return;
+    auto* upstream = s_core->get_client() ? s_core->get_client()->get_player() : nullptr;
+    if (!upstream) {
+        send_console(server->get_player(), "`4Not connected to the game server.");
+        return;
+    }
+    ByteStream<std::uint16_t> stream{};
+    stream.write(packet::NET_MESSAGE_GAME_MESSAGE);
+    stream.write("action|respawn", false);
+    upstream->send_packet(stream.get_data(), 0);
+    send_console(server->get_player(), "`9Respawn requested.");
+}
+
+RandomWorldCommand::RandomWorldCommand()
+    : CommandBase({"rndm", "randomworld"}, {}, "Warp to a recently visited world", 0) {}
+std::unique_ptr<CommandBase> RandomWorldCommand::clone() const {
+    return std::make_unique<RandomWorldCommand>();
+}
+void RandomWorldCommand::set_core(core::Core* core) { s_core = core; }
+void RandomWorldCommand::execute(client::Client* client, const std::vector<std::string>&) {
+    if (!s_core || !client || !client->get_player()) return;
+    auto* server = s_core->get_server();
+    auto* upstream = s_core->get_client() ? s_core->get_client()->get_player() : nullptr;
+    if (!server || !server->get_player() || !upstream) return;
+
+    auto worlds = utils::WorldManager::get_instance().get_known_world_names();
+    const auto current = utils::WorldManager::get_instance().get_world_name();
+    auto normalize = [](std::string value) {
+        std::transform(value.begin(), value.end(), value.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return value;
+    };
+    worlds.erase(std::remove_if(worlds.begin(), worlds.end(), [&](const std::string& name) {
+        return normalize(name) == normalize(current);
+    }), worlds.end());
+    if (worlds.empty()) {
+        send_console(server->get_player(), "`4No previously visited world is available. Visit another world first.");
+        return;
+    }
+
+    static std::mt19937 rng{std::random_device{}()};
+    std::uniform_int_distribution<std::size_t> pick(0, worlds.size() - 1);
+    const auto& destination = worlds[pick(rng)];
+    ByteStream<std::uint16_t> stream{};
+    stream.write(packet::NET_MESSAGE_GAME_MESSAGE);
+    stream.write("action|join_request\nname|" + destination + "\ninvitedWorld|0\n", false);
+    upstream->send_packet(stream.get_data(), 0);
+    send_console(server->get_player(), fmt::format("`9Warping to recently visited world: `w{}", destination));
+}
+
+namespace {
+bool toggle_config_bool(core::Core* core, const char* key) {
+    bool previous = false;
+    try { previous = core->get_config().get<bool>(key); } catch (...) { }
+    core->get_config().set<bool>(key, !previous);
+    return !previous;
+}
+}
+
+SpinAllCommand::SpinAllCommand()
+    : CommandBase({"spinall"}, {}, "Toggle QQ and REME annotations for reported wheel spins", 0) {}
+std::unique_ptr<CommandBase> SpinAllCommand::clone() const { return std::make_unique<SpinAllCommand>(); }
+void SpinAllCommand::set_core(core::Core* core) { s_core = core; }
+void SpinAllCommand::execute(client::Client* client, const std::vector<std::string>&) {
+    if (!s_core || !client || !client->get_player()) return;
+    auto* server = s_core->get_server();
+    if (!server || !server->get_player()) return;
+    bool enabled = false;
+    try { enabled = s_core->get_config().get<bool>("features.host.show_qq_number")
+                  && s_core->get_config().get<bool>("features.host.show_reme_spin"); } catch (...) { }
+    s_core->get_config().set<bool>("features.host.show_qq_number", !enabled);
+    s_core->get_config().set<bool>("features.host.show_reme_spin", !enabled);
+    utils::PacketUtils::send_chat_message(server->get_player(), enabled
+        ? "`9Wheel spin annotations disabled."
+        : "`2Wheel spin annotations enabled (QQ + REME). Spins remain manual.");
+}
+
+FastWheelCommand::FastWheelCommand()
+    : CommandBase({"fastwheel"}, {}, "Toggle instant display for reported roulette spins", 0) {}
+std::unique_ptr<CommandBase> FastWheelCommand::clone() const { return std::make_unique<FastWheelCommand>(); }
+void FastWheelCommand::set_core(core::Core* core) { s_core = core; }
+void FastWheelCommand::execute(client::Client* client, const std::vector<std::string>&) {
+    if (!s_core || !client || !client->get_player()) return;
+    auto* server = s_core->get_server();
+    if (!server || !server->get_player()) return;
+    const bool enabled = toggle_config_bool(s_core, "features.host.instant_roulette_spin");
+    utils::PacketUtils::send_chat_message(server->get_player(), enabled
+        ? "`2Instant roulette spin display enabled."
+        : "`9Instant roulette spin display disabled.");
 }
 
 

@@ -8,6 +8,7 @@
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <spdlog/spdlog.h>
 #include <string>
 #include <atomic>
 #include <cstring>
@@ -29,6 +30,7 @@ extern "C" {
 
 struct TcpConn {
     SOCKET s = INVALID_SOCKET;
+    sockaddr_in peer_addr{};   // the proxy's address, used for the 0.0.0.0 relay fallback
     explicit TcpConn(const std::string& host, uint16_t port) {
         struct addrinfo hints{}, *res = nullptr;
         hints.ai_family   = AF_INET;
@@ -41,11 +43,53 @@ struct TcpConn {
         DWORD tv = 10000;
         setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
         setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof tv);
-        if (::connect(s, res->ai_addr, (int)res->ai_addrlen) != 0) {
-            freeaddrinfo(res); closesocket(s); s = INVALID_SOCKET;
-            throw std::runtime_error("SOCKS5: TCP connect failed");
-        }
+
+        // Bound the TCP connect. SO_RCVTIMEO/SO_SNDTIMEO do NOT apply to connect(), so an
+        // unreachable proxy previously blocked this thread for the OS default (~21 s on
+        // Windows). This runs from the ENet Connection event, i.e. on the relay thread,
+        // so an unbounded stall here starves both ENet hosts and looks like a random
+        // disconnect. Use a non-blocking connect + select with a hard deadline.
+        u_long nonblocking = 1;
+        ioctlsocket(s, FIONBIO, &nonblocking);
+
+        const int rc = ::connect(s, res->ai_addr, (int)res->ai_addrlen);
+        const int lastError = WSAGetLastError();
         freeaddrinfo(res);
+
+        bool connected = (rc == 0);
+        if (!connected && lastError == WSAEWOULDBLOCK) {
+            fd_set writeSet;
+            FD_ZERO(&writeSet);
+            FD_SET(s, &writeSet);
+
+            timeval timeout{};
+            timeout.tv_sec  = 10;
+            timeout.tv_usec = 0;
+
+            const int sel = ::select(0, nullptr, &writeSet, nullptr, &timeout);
+            if (sel > 0) {
+                int soError = 0;
+                int len = sizeof(soError);
+                if (getsockopt(s, SOL_SOCKET, SO_ERROR, (char*)&soError, &len) == 0 && soError == 0) {
+                    connected = true;
+                }
+            }
+        }
+
+        if (!connected) {
+            closesocket(s); s = INVALID_SOCKET;
+            throw std::runtime_error("SOCKS5: TCP connect failed or timed out");
+        }
+
+        nonblocking = 0;
+        ioctlsocket(s, FIONBIO, &nonblocking);
+
+        // Remember the proxy address we are actually connected to; the UDP ASSOCIATE
+        // reply may legitimately tell us to relay through this same address.
+        int peerLen = sizeof(peer_addr);
+        if (getpeername(s, (struct sockaddr*)&peer_addr, &peerLen) != 0) {
+            memset(&peer_addr, 0, sizeof(peer_addr));
+        }
     }
     ~TcpConn() { if (s != INVALID_SOCKET) closesocket(s); }
     void tx(const uint8_t* b, int n) {
@@ -125,6 +169,37 @@ inline void connect(const std::string& host, uint16_t port,
         relay.sin_family = AF_INET;
         memcpy(&relay.sin_addr, tail,     4);
         memcpy(&relay.sin_port, tail + 4, 2); 
+    }
+
+    // Fallback the SOCKS5 spec allows and many servers rely on: a reply address of
+    // 0.0.0.0:0 means "the relay is at the same address you reached over TCP". Without
+    // this, every wrapped datagram is sent to 0.0.0.0 and dropped, so the upstream ENet
+    // handshake can never complete -- the tunnel reports success and then nothing works.
+    {
+        const bool addr_unspecified = (relay.sin_addr.s_addr == 0);
+        const bool port_unspecified = (relay.sin_port == 0);
+
+        if (addr_unspecified || port_unspecified) {
+            char reply_ip[INET_ADDRSTRLEN] = { 0 };
+            inet_ntop(AF_INET, &relay.sin_addr, reply_ip, sizeof(reply_ip));
+
+            if (addr_unspecified) {
+                relay.sin_addr = tc.peer_addr.sin_addr;
+            }
+            if (port_unspecified) {
+                relay.sin_port = tc.peer_addr.sin_port;
+            }
+
+            char fixed_ip[INET_ADDRSTRLEN] = { 0 };
+            inet_ntop(AF_INET, &relay.sin_addr, fixed_ip, sizeof(fixed_ip));
+            spdlog::warn("[SOCKS5] relay reply was {}:0 -- many proxies mean \"same address as "
+                         "the control connection\"; substituting {}:{}",
+                         reply_ip, fixed_ip, ntohs(relay.sin_port));
+        }
+
+        char relay_ip[INET_ADDRSTRLEN] = { 0 };
+        inet_ntop(AF_INET, &relay.sin_addr, relay_ip, sizeof(relay_ip));
+        spdlog::info("[SOCKS5] UDP relay address = {}:{}", relay_ip, ntohs(relay.sin_port));
     }
 
     

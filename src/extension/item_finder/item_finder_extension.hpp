@@ -12,6 +12,7 @@
 #include "../command_handler/vendloc_command.hpp"
 #include "../command_handler/clothes_command.hpp"
 #include <spdlog/spdlog.h>
+#include <cstdlib>
 #include <memory>
 #include <unordered_map>
 #include <thread>
@@ -48,20 +49,42 @@ public:
 
     void init() override {
         
-        if (!items_json_path_.empty() && database_->load_from_json(items_json_path_)) {
-            spdlog::trace("Item database loaded successfully: {} items", database_->get_item_count());
+        if (items_json_path_.empty()) {
+            spdlog::warn("Items database not found. Looked in:");
+            spdlog::warn("  ./resources/decoded_items.json  ./decoded_items.json  ../decoded_items.json");
+            spdlog::warn("Set SKRIPT_ITEMS_JSON to point at your own decoded_items.json");
+        }
+        else if (!database_->load_from_json(items_json_path_)) {
+            spdlog::warn("Failed to load items database from: {}", items_json_path_);
+            if (!database_->load_error().empty()) {
+                spdlog::warn("  reason: {}", database_->load_error());
+            }
+        }
+        else if (database_->get_item_count() == 0) {
+            spdlog::warn("Items database at {} parsed but contained no usable items", items_json_path_);
+        }
+        else {
+            spdlog::info("Item database loaded: {} items (schema version {}) from {}",
+                database_->get_item_count(), database_->schema_version(), items_json_path_);
+
+            if (database_->last_duplicate_ids() > 0) {
+                spdlog::warn("  {} duplicate item id(s) ignored (first occurrence wins)",
+                    database_->last_duplicate_ids());
+            }
+            if (database_->last_skipped() > 0) {
+                spdlog::warn("  {} malformed item entr(ies) skipped", database_->last_skipped());
+            }
+
+            
             
             
             command::VendLocCommand::set_item_database(database_.get());
             command::VendTPCommand::set_item_database(database_.get());
-            
+
             
             SetItemDatabase(database_.get());
-        } else {
-            spdlog::warn("Failed to load items database from: {}", items_json_path_);
-            spdlog::warn("Item finder will not be available");
-            return;
         }
+        
         
         
         core_->get_event_dispatcher().appendListener(
@@ -106,12 +129,19 @@ public:
 private:
     std::string find_items_json() {
         
+        const char* env_path = std::getenv("SKRIPT_ITEMS_JSON");
+        
         std::vector<std::string> possible_paths = {
-            "C:\\Users\\11User\\OneDrive\\Desktop\\botrdp\\dtm\\itemsdecoder\\decoded_items.json",
             "./resources/decoded_items.json",
             "./decoded_items.json",
-            "../decoded_items.json"
+            "../decoded_items.json",
+            "../../resources/decoded_items.json",
+            "../../decoded_items.json"
         };
+        
+        if (env_path != nullptr && env_path[0] != '\0') {
+            possible_paths.insert(possible_paths.begin(), std::string{ env_path });
+        }
         
         for (const auto& path : possible_paths) {
             std::ifstream file(path);
@@ -125,7 +155,10 @@ private:
     
     void handle_find_command(const core::EventMessage& evt, const std::string& text) {
         
+        
         evt.canceled = true;
+        
+        ensure_database_loaded();
         
         
         std::string query = "";
@@ -135,6 +168,30 @@ private:
         
         
         show_item_finder_dialog(evt, query, "");
+    }
+
+    
+    
+    
+    void ensure_database_loaded() {
+        if (database_->get_item_count() > 0) {
+            return;
+        }
+
+        if (items_json_path_.empty()) {
+            items_json_path_ = find_items_json();
+        }
+        if (items_json_path_.empty()) {
+            return;
+        }
+
+        if (database_->load_from_json(items_json_path_) && database_->get_item_count() > 0) {
+            spdlog::info("Item database loaded lazily: {} items (schema version {})",
+                database_->get_item_count(), database_->schema_version());
+            command::VendLocCommand::set_item_database(database_.get());
+            command::VendTPCommand::set_item_database(database_.get());
+            SetItemDatabase(database_.get());
+        }
     }
     
     void show_item_finder_dialog(const core::EventMessage& evt, const std::string& query, const std::string& search_type = "all") {

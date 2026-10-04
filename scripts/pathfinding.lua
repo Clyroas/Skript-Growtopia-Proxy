@@ -7,7 +7,9 @@ function manhattan_distance(x1, y1, x2, y2)
 end
 
 -- A* pathfinding - returns path or nil if no path found
-function FindPath(start_x, start_y, end_x, end_y, collision_callback)
+-- Keep this grid-search helper separate from the proxy's native FindPath(x, y),
+-- which moves the player to a world coordinate.
+function FindPathGrid(start_x, start_y, end_x, end_y, collision_callback)
     -- collision_callback(x, y) should return true if tile is walkable
     local is_walkable = collision_callback or function(x, y)
         -- Default: assume all tiles walkable
@@ -107,7 +109,7 @@ function FindPath(start_x, start_y, end_x, end_y, collision_callback)
 end
 
 -- Example usage in Growtopia Lua:
--- local path = FindPath(0, 0, 10, 10)
+-- local path = FindPathGrid(0, 0, 10, 10)
 -- if path then
 --     for i, node in ipairs(path) do
 --         print("Step " .. i .. ": (" .. node.x .. ", " .. node.y .. ")")

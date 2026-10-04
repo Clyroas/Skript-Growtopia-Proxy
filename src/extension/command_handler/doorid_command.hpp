@@ -17,6 +17,7 @@ public:
     
     static void set_core(core::Core* core);
     static void toggle_door_id_reveal();
+    static void set_door_id_reveal(bool enabled);
     static bool is_door_id_reveal_enabled();
     static void handle_send_to_server(const std::string& server_info);
 
@@ -27,7 +28,7 @@ private:
     static void send_console_message(const std::string& message);
     static int find_door_id_near(int tx, int ty, std::string& out_id);
 
-    static bool s_reveal_enabled;
+    static std::atomic<bool> s_reveal_enabled;
     static core::Core* s_core;
     static std::atomic<bool> s_monitor_running;
     static std::thread s_monitor_thread;

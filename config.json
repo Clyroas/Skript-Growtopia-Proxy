@@ -1,8 +1,10 @@
 {
     "server.port": 17091,
     "server.address": "www.growtopia1.com",
-    "client.game_version": "5.21",
-    "client.protocol": 312,
+    "client.game_version": "auto",
+    "client.protocol": 0,
+    "client.protocol_override": 0,
+    "client.version_override": "",
     "client.dnsServer": "cloudflare",
     "extension.ignore": [
         "0xdeadbeef"

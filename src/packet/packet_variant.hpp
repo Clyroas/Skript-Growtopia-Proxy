@@ -1,4 +1,5 @@
 #pragma once
+#include <optional>
 #include <string>
 #include <variant>
 #include <vector>
@@ -215,6 +216,33 @@ public:
         }
 
         variants_[index] = value;
+    }
+
+    
+    
+    
+    
+    
+    
+    [[nodiscard]] std::optional<int32_t> get_any_int(const std::size_t index) const
+    {
+        if (index >= variants_.size()) {
+            return std::nullopt;
+        }
+
+        const variant& value{ variants_[index] };
+
+        if (const auto* signed_value{ std::get_if<int32_t>(&value) }; signed_value) {
+            return *signed_value;
+        }
+        if (const auto* unsigned_value{ std::get_if<uint32_t>(&value) }; unsigned_value) {
+            return static_cast<int32_t>(*unsigned_value);
+        }
+        if (const auto* float_value{ std::get_if<float>(&value) }; float_value) {
+            return static_cast<int32_t>(*float_value);
+        }
+
+        return std::nullopt;
     }
 
     [[nodiscard]] std::vector<variant> get_variants() const { return variants_; }
