@@ -167,8 +167,12 @@ private:
                 
                 if (g_parsed_world.parse((const uint8_t*)ext_data.data(), ext_data.size())) {
                     
-                    if (g_parsed_world.had_warnings) {
-                        send_text_overlay("`4World parse warning; GrowScan may be unreliable");
+                    // had_warnings also fires for benign recovery heuristics (byte
+                    // resyncs, count clamps). Only surface the overlay when tiles were
+                    // actually lost, so ordinary worlds don't nag the user.
+                    if (g_parsed_world.tiles_filled_as_empty > 0 ||
+                        g_parsed_world.tiles.size() < g_parsed_world.tile_count) {
+                        send_text_overlay("`4World parse warning; some tiles could not be read");
                     }
 
                     uint32_t player_id = event.get_player().get_peer()->connectID;

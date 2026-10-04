@@ -18,7 +18,8 @@ function Invoke-Test {
     param(
         [string]$Name,
         [string]$Source,
-        [string[]]$ExtraArgs = @()
+        [string[]]$ExtraArgs = @(),
+        [string[]]$ExtraSources = @()
     )
 
     Write-Host ""
@@ -35,7 +36,7 @@ function Invoke-Test {
         '/nologo', '/std:c++latest', '/EHsc', '/W3', '/wd4267', '/wd4101'
     ) + $ExtraArgs + @(
         "/Fe:$exe", "/Fo:$obj\", $Source
-    )
+    ) + $ExtraSources
 
     & cl.exe @compileArgs
     if ($LASTEXITCODE -ne 0) {
@@ -63,6 +64,7 @@ Invoke-Test -Name 'server_data_parser'   -Source 'tests\server_data_parser_test.
 Invoke-Test -Name 'spawn_field'          -Source 'tests\spawn_field_test.cpp'
 Invoke-Test -Name 'packet_variant'       -Source 'tests\packet_variant_test.cpp' -ExtraArgs @('/I', 'tests\stub')
 Invoke-Test -Name 'declaration_handling' -Source 'tests\declaration_handling_test.cpp'
+Invoke-Test -Name 'world_parser'         -Source 'tests\world_parser_test.cpp' -ExtraArgs @('/I', 'tests\stub') -ExtraSources @('src\utils\world_parser_v2.cpp')
 
 # --- item database tests (need vendored nlohmann/json) ---
 $jsonInclude = '/Ilib\nlohmann_json\include'

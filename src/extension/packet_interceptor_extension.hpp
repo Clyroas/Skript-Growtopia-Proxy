@@ -123,7 +123,10 @@ private:
             item.Amount = static_cast<uint32_t>(tank->float_var);
             item.Flag = static_cast<uint32_t>(tank->flags);
             
-            static uint32_t uid_counter = 1;
+            // Synthetic uids live in a high range so they can never collide with a real
+            // world object's uid - collisions made /pickup and GrowScan treat different
+            // items as the same one.
+            static uint32_t uid_counter = 1000000;
             item.Uid = uid_counter++;
             
             world_mgr.add_live_object(item);

@@ -1,5 +1,42 @@
 # Changelog
 
+## [2.3.2] — Floating items on official servers, GrowScan accuracy, warning noise
+
+### Fixed — floating items still undetected on official worlds
+
+The item-section scan only tried GTPS-style record layouts: record sizes 16-24 with
+a 32-bit uid, and it always assumed 4 filler bytes between the item count and the
+first record. Official servers use the classic layout — 14-byte records with an
+8-bit count and 16-bit uid, with no filler — which the scan therefore never found,
+so official worlds showed blocks but zero floating items. The scan now:
+
+- tries every record size from 13 to 28 bytes, with per-size count/uid field
+  widths and positions (16-bit uids included);
+- tries both item starts (immediately after the count, and after 4 filler bytes);
+- bounds coordinates by the actual world dimensions instead of a fixed ceiling;
+- searches up to 4096 bytes past the tile region, so a mildly misaligned tile
+  parse no longer hides the item section.
+
+A new `world_parser` test feeds synthetic worlds in both layouts to the parser and
+fails if the items are not decoded, so this cannot silently regress again.
+
+### Fixed — GrowScan misinformation
+
+- GrowScan read the world manager's unsynchronized reference getters, so a world
+  change mid-scan could produce torn, inconsistent results. It now uses locked
+  snapshots.
+- Dropped items were double-counted: the interceptor copies world items into the
+  live-object list when they are touched, and GrowScan summed both lists. Live
+  copies are now deduplicated by uid, and synthetic uids assigned to live drops
+  start at 1'000'000 so they can never collide with real world uids (which also
+  protects `/pickup` and AutoCollect matching).
+
+### Changed — world-parse warning overlay
+
+The "World parse warning" overlay fired on any parser warning, including benign
+byte-resyncs and count clamps. It now appears only when tiles were actually lost
+(filled as empty / fewer tiles than the header claims), with accurate wording.
+
 ## [2.3.1] — Session-kill fixes: reconnects no longer destroy the live session
 
 The proxy's own reconnect machinery was killing healthy sessions, which looked to the
