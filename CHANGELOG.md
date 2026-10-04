@@ -1,5 +1,34 @@
 # Changelog
 
+## [2.3.3] — Disconnects after using features in crowded worlds
+
+The log from the post-2.3.1 run showed the remaining kill path precisely: a fresh
+session died one line after `Client connection ready`, torn down by a disconnect
+event for a peer from an *older* session.
+
+### Fixed — client quit left the upstream session poisoned
+
+When the local client quit or was dropped, `Server::on_disconnect` disconnected the
+upstream peer but never cleared `Client::player_`. The stale player object kept
+wrapping a dead ENet peer whose slot ENet then **reused** for the next connection —
+so when lingering peers from previous sessions fired their (perfectly normal)
+disconnect events, the event's peer could match the stale object, pass the identity
+check, and destroy the brand-new session. Crowded worlds amplify this: more players
+means more sub-server switches and relogs, more lingering peers, and more chances
+for a stale goodbye to land on the recycled peer.
+
+- `Client::on_local_disconnect()` now fully tears the upstream side down (peer,
+  player object, tracked connectID) whenever the local client goes away.
+- Both `on_disconnect` handlers now also compare the peer's **connectID**, not just
+  the pointer, so an event delivered on a recycled peer object can never be
+  mistaken for the live session.
+
+### Changed — per-packet packet-log firehose
+
+The `[PACKET-LOG]` extension logged every packet at info level for a minute after
+each world load — megabytes of synchronous disk I/O per crowded-world session on
+the relay thread, stalling both hosts' servicing. It is now debug-level.
+
 ## [2.3.2] — Floating items on official servers, GrowScan accuracy, warning noise
 
 ### Fixed — floating items still undetected on official worlds

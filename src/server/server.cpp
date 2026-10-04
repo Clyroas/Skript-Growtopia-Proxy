@@ -177,6 +177,7 @@ void Server::on_connect(ENetPeer* peer)
     clear_pending();
 
     player_ = new player::Player{ peer };
+    active_client_connect_id_ = peer->connectID;
 
     
     core::EventConnection event_connection{ *player_ };
@@ -618,10 +619,11 @@ void Server::on_disconnect(ENetPeer* peer)
     );
 
     // With multiple peer slots, a DISCONNECT event can arrive for a peer that was
-    // superseded (replaced in on_connect) or rejected while no player existed. That
-    // goodbye must not tear down the live session: only the peer of the current
-    // session may end it.
-    if (player_ && player_->get_peer() != peer) {
+    // superseded (replaced in on_connect) or rejected while no player existed. ENet
+    // also recycles peer objects once their slot is freed. Only the peer of the
+    // current session - same object AND same connectID - may end it.
+    if (player_ && (player_->get_peer() != peer ||
+                    peer->connectID != active_client_connect_id_)) {
         spdlog::warn("[ENET] Ignoring disconnect event for a superseded client peer {}:{}",
                      network::format_ip_address(peer->address.host), peer->address.port);
         return;
@@ -642,15 +644,17 @@ void Server::on_disconnect(ENetPeer* peer)
     
     utils::APIClient::set_online_connected(false);
 
-    
-    const player::Player* to_player = core_->get_client()->get_player();
-    if (to_player) {
-        spdlog::info("Also disconnecting from real server");
-        to_player->disconnect_now();
-    }
+    // The local client is gone (quit or dropped): tear the upstream side down too and
+    // drop the stale upstream player object. This used to only disconnect the peer,
+    // leaving Client::player_ alive wrapping a dead peer whose slot ENet then reused
+    // for the next session - so a lingering peer's disconnect event could match the
+    // stale object and kill the fresh session the moment it connected. That was the
+    // "disconnect right after connecting, worse in crowded worlds" loop.
+    core_->get_client()->on_local_disconnect();
 
     delete player_;
     player_ = nullptr;
+    active_client_connect_id_ = 0;
 
     clear_pending();
 

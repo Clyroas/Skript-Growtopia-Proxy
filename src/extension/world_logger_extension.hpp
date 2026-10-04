@@ -124,18 +124,22 @@ private:
             auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
                 std::chrono::steady_clock::now() - last_world_load
             ).count();
-            
-            if (elapsed < 60) {  
-                spdlog::info("[PACKET-LOG] Type={} Size={} (+{}s after world load)", 
-                            (int)game_packet.type, event.get_ext_data().size(), (int)elapsed);
+
+            // debug, not info: this fires for every packet for a minute after each
+            // world load. At info level it wrote megabytes of synchronous disk I/O
+            // per crowded-world session on the relay thread, stalling both hosts'
+            // servicing while the lock was held.
+            if (elapsed < 60) {
+                spdlog::debug("[PACKET-LOG] Type={} Size={} (+{}s after world load)",
+                              (int)game_packet.type, event.get_ext_data().size(), (int)elapsed);
             } else {
                 logging_enabled = false;
             }
         }
-        
-        
+
+
         if (game_packet.type == packet::PACKET_ITEM_CHANGE_OBJECT) {
-            spdlog::info("[ITEM_CHANGE_OBJECT DETECTED] Size={} bytes", event.get_ext_data().size());
+            spdlog::debug("[ITEM_CHANGE_OBJECT DETECTED] Size={} bytes", event.get_ext_data().size());
         }
         
         switch (game_packet.type) {

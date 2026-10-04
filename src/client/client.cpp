@@ -291,6 +291,7 @@ void Client::on_connect(ENetPeer* peer)
     }
 
     player_ = new player::Player{ peer };
+    active_upstream_connect_id_ = peer->connectID;
 
     core::EventConnection event_connection{ *player_ };
     event_connection.from = core::EventFrom::FromServer;
@@ -842,17 +843,39 @@ void Client::handle_redirected_packet(ByteStream<std::uint16_t>& byte_stream, pl
     to_player->send_packet(byte_stream.get_data(), 0);
 }
 
+void Client::on_local_disconnect()
+{
+    active_upstream_connect_id_ = 0;
+    if (!player_) {
+        return;
+    }
+    player_->disconnect_now();
+    delete player_;
+    player_ = nullptr;
+    {
+        const net::ENetLock guard{ net::enet_traffic_mutex() };
+        enet_host_flush(host_);
+    }
+}
+
 void Client::on_disconnect(ENetPeer* peer)
 {
     // With multiple peer slots, a DISCONNECT event can be delivered for a stale peer:
     // a superseded session the server retired, or a connect attempt that timed out
-    // while still occupying a slot. Only the peer of the current session may tear that
-    // session down - treating a stale peer's goodbye as the live session's own killed
-    // every fresh reconnect and looked like "random disconnects" (and, to the player,
-    // like the last feature they used was at fault).
-    if (player_ && player_->get_peer() != peer) {
+    // while still occupying a slot. ENet also recycles peer objects once their slot
+    // is freed, so a bare pointer match against a leftover player object means
+    // nothing. Only the peer of the current session - same object AND same connectID
+    // - may tear that session down. Killing the live session for a stale goodbye
+    // looked like "random disconnects" (and, to the player, like the last feature
+    // they used was at fault).
+    if (!player_ || player_->get_peer() != peer ||
+        peer->connectID != active_upstream_connect_id_) {
         spdlog::warn("[ENET] Ignoring disconnect event for a non-active upstream peer {}:{}",
                      network::format_ip_address(peer->address.host), peer->address.port);
+        if (!player_ && socks5_tunnel::is_active()) {
+            socks5_tunnel::disconnect();
+            spdlog::info("[SOCKS5] Tunnel closed on upstream teardown");
+        }
         return;
     }
 
@@ -862,14 +885,9 @@ void Client::on_disconnect(ENetPeer* peer)
         peer->address.port
     );
 
-    
     if (socks5_tunnel::is_active()) {
         socks5_tunnel::disconnect();
         spdlog::info("[SOCKS5] Tunnel closed on server disconnect");
-    }
-
-    if (!player_) {
-        return;
     }
 
     core::EventDisconnection event_disconnection{ *player_ };
@@ -878,6 +896,7 @@ void Client::on_disconnect(ENetPeer* peer)
 
     delete player_;
     player_ = nullptr;
+    active_upstream_connect_id_ = 0;
 
     const player::Player* to_player{ core_->get_server()->get_player() };
     if (!to_player) {

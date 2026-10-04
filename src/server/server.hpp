@@ -1,6 +1,7 @@
 #pragma once
 #include <enet/enet.h>
 
+#include <cstdint>
 #include <deque>
 
 #include "../core/core.hpp"
@@ -32,6 +33,11 @@ private:
     ENetHost* host_;
     core::Core* core_;
     player::Player* player_;
+
+    // connectID of the client-facing peer the current session runs on. ENet recycles
+    // peer objects once their slot is freed, so pointer identity alone cannot tell a
+    // live session from a stale event delivered on a recycled peer.
+    std::uint32_t active_client_connect_id_ = 0;
 
     // Client packets that arrived before the upstream link was ready. All access
     // happens under the shared ENet traffic lock (on_receive, flush, clear).
