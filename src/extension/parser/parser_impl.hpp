@@ -71,7 +71,9 @@ class ParserExtension final : public IParserExtension {
         int repeats_left = 1;
         int repeat_interval_ms = 0;
     };
-    std::vector<DeferredSend> deferred_sends_;
+    // Mutable: const packet handlers enqueue here; the queue is flushed by Tick on
+    // the same single Core::run() thread, so no race is introduced.
+    mutable std::vector<DeferredSend> deferred_sends_;
     std::unordered_map<std::string, std::chrono::steady_clock::time_point> recent_real_spins_;
     std::unordered_map<int, std::chrono::steady_clock::time_point> recent_real_spin_values_;
     std::unordered_map<std::string, std::chrono::steady_clock::time_point> recent_fake_spins_;
@@ -200,7 +202,7 @@ public:
     }
 
 private:
-    void defer_upstream_text(std::string payload, int delay_ms, int repeats = 1, int interval_ms = 0) {
+    void defer_upstream_text(std::string payload, int delay_ms, int repeats = 1, int interval_ms = 0) const {
         DeferredSend item;
         item.kind = DeferredSend::Kind::UpstreamText;
         item.due = std::chrono::steady_clock::now() + std::chrono::milliseconds(delay_ms);
@@ -214,7 +216,7 @@ private:
         deferred_sends_.push_back(std::move(item));
     }
 
-    void defer_client_chat(std::string message, int delay_ms) {
+    void defer_client_chat(std::string message, int delay_ms) const {
         DeferredSend item;
         item.kind = DeferredSend::Kind::ClientChat;
         item.due = std::chrono::steady_clock::now() + std::chrono::milliseconds(delay_ms);
@@ -222,7 +224,7 @@ private:
         deferred_sends_.push_back(std::move(item));
     }
 
-    void defer_display_apply(int32_t net_id, std::string name, int delay_ms) {
+    void defer_display_apply(int32_t net_id, std::string name, int delay_ms) const {
         DeferredSend item;
         item.kind = DeferredSend::Kind::DisplayApply;
         item.due = std::chrono::steady_clock::now() + std::chrono::milliseconds(delay_ms);

@@ -89,7 +89,7 @@ public:
                     spdlog::error("Upstream connect failed; client session has no upstream");
                 }
             }
-        )
+        );
 
         
         check_ca_certificate();
