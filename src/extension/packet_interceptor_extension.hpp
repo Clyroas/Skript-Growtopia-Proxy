@@ -80,7 +80,7 @@ private:
                     break;
             }
         }
-    }    }
+    }
 
     void handle_item_change_object(const packet::TankUpdatePacket* tank) {
         auto& world_mgr = utils::WorldManager::get_instance();

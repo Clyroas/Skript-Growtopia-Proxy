@@ -12,6 +12,14 @@ public:
     Config();
     ~Config() = default;
 
+    // X9: key-existence check so callers can seed defaults without wiping
+    // values the user already set in config.json.
+    [[nodiscard]] bool contains(const std::string& key) const
+    {
+        std::lock_guard<std::mutex> lock(config_mutex_);
+        return config_.find(key) != config_.end();
+    }
+
     template <typename T = std::string>
     [[nodiscard]] T get(const std::string& key) const
     {
