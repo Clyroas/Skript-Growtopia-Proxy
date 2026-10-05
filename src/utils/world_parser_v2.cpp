@@ -1,5 +1,7 @@
 #include "world_parser_v2.h"
 #include <spdlog/spdlog.h>
+#include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <iomanip>
 #include <sstream>
@@ -746,6 +748,11 @@ bool World::parse(const uint8_t* data, size_t size) {
         spdlog::info("  - {} tiles parsed from data", tiles_parsed_from_data);
         spdlog::info("  - {} tiles filled as empty", tiles_filled_as_empty);
         
+        // The locals above shadow these members; publish the real values so callers
+        // (the world-parse warning overlay) can tell lost tiles from benign resyncs.
+        this->tiles_parsed_from_data = tiles_parsed_from_data;
+        this->tiles_filled_as_empty = tiles_filled_as_empty;
+        
         size_t pos_after_tiles = reader.position();
         size_t remaining_bytes = size - pos_after_tiles;
         
@@ -775,85 +782,168 @@ bool World::parse(const uint8_t* data, size_t size) {
         if (remaining_bytes > 8) {
             try {
                 size_t start_pos = reader.position();
-                
-                struct ScanResult { size_t offset; uint32_t count; uint32_t size; int score; };
+
+                struct ScanResult { size_t offset; uint32_t gap; uint32_t count; uint32_t size; int score; };
                 std::vector<ScanResult> results;
 
-                
-                for (size_t offset = 0; offset <= 128 && (start_pos + offset + 8) <= size; offset += 1) {
+                // Item coordinates use the full pixel range of the actual world, which we
+                // know at this point - much stronger than any fixed bound. The floor keeps
+                // the window wide enough for worlds whose dimensions parsed oddly.
+                const float max_x = std::max(8192.0f, static_cast<float>(width) * 32.0f + 64.0f);
+                const float max_y = std::max(8192.0f, static_cast<float>(height) * 32.0f + 64.0f);
+                constexpr uint32_t kMaxCount = 100000;
+                constexpr size_t kMaxScanOffset = 4096;
+
+                // Record layout varies by server: count field width and uid field width/
+                // position differ between the classic official format and GTPS variants.
+                auto count_width = [](uint32_t s) -> uint32_t { return s >= 18 ? 4 : (s == 17 ? 2 : 1); };
+                auto uid_width = [](uint32_t s) -> uint32_t { return s >= 15 ? 4 : 2; };
+                auto uid_offset = [](uint32_t s) -> uint32_t { return s >= 15 ? s - 4 : s - 2; };
+
+                for (size_t offset = 0; offset <= kMaxScanOffset && (start_pos + offset + 16) <= size; offset += 1) {
                     reader.seek(start_pos + offset);
                     uint32_t test_count = reader.read<uint32_t>();
-                    uint32_t test_uid = reader.read<uint32_t>();
-                    (void)test_uid;
+                    if (test_count == 0 || test_count > kMaxCount) continue;
 
-                    if (test_count == 0 || test_count > 15000) continue;
+                    // Some servers place 4 filler bytes between the count and the first
+                    // record; official data starts the records immediately.
+                    for (uint32_t gap : {0u, 4u}) {
+                        size_t items_start = start_pos + offset + 4 + gap;
+                        if (items_start >= size) continue;
+                        size_t bytes_left = size - items_start;
 
-                    size_t items_start = reader.position();
-                    size_t bytes_left = size - items_start;
+                        for (uint32_t s = 13; s <= 28; ++s) {
+                            if ((size_t)test_count * s + 4 > bytes_left) continue;
 
-                    
-                    for (uint32_t s : {16, 17, 18, 19, 20, 22, 24}) {
-                        if ((size_t)test_count * s > bytes_left) continue;
-
-                        int score = 0;
-                        for (uint32_t i = 0; i < std::min(test_count, 10U); ++i) {
-                            reader.seek(items_start + (i * s));
-                            uint16_t id = reader.read<uint16_t>();
-                            float x = reader.read<float>();
-                            float y = reader.read<float>();
-                            if (id > 0 && id < 22000 && x >= 0 && x < 4000 && y >= 0 && y < 4000) {
-                                score++;
+                            // Cheap prefilter: the first record must look like a real item.
+                            reader.seek(items_start);
+                            uint16_t id0 = reader.read<uint16_t>();
+                            float x0 = reader.read<float>();
+                            float y0 = reader.read<float>();
+                            if (id0 == 0 || id0 >= 22000 || !std::isfinite(x0) || x0 < 0.0f || x0 >= max_x ||
+                                !std::isfinite(y0) || y0 < 0.0f || y0 >= max_y) {
+                                continue;
                             }
-                        }
-                        if (score >= 1) {
-                            results.push_back({offset, test_count, s, score});
+
+                            int score = 0;
+                            int sampled = 0;
+                            uint32_t first_uid = 0;
+                            uint32_t prev_uid = 0;
+                            bool uids_consecutive = true;
+                            for (uint32_t i = 0; i < std::min(test_count, 12U); ++i) {
+                                reader.seek(items_start + (i * s));
+                                uint16_t id = reader.read<uint16_t>();
+                                float x = reader.read<float>();
+                                float y = reader.read<float>();
+                                reader.seek(items_start + (i * s) + uid_offset(s));
+                                uint32_t uid = uid_width(s) == 4 ? reader.read<uint32_t>()
+                                                                 : reader.read<uint16_t>();
+                                if (i == 0) first_uid = uid;
+                                if (i > 0 && uid != prev_uid + 1) uids_consecutive = false;
+                                prev_uid = uid;
+
+                                if (id == 0) continue;
+                                ++sampled;
+                                if (id < 22000 && std::isfinite(x) && x >= 0.0f && x < max_x &&
+                                    std::isfinite(y) && y >= 0.0f && y < max_y) {
+                                    score++;
+                                } else {
+                                    score -= 2;
+                                }
+                            }
+                            if (sampled == 0) continue;
+
+                            // Structural bonuses a random byte pattern cannot pass: the u32
+                            // trailing the block should be the last object's uid (Growtopia
+                            // allocates object uids sequentially), and sampled uids should
+                            // run consecutively.
+                            int bonus = 0;
+                            if (uid_width(s) == 4) {
+                                reader.seek(items_start + (size_t)test_count * s);
+                                uint32_t tail_uid = reader.read<uint32_t>();
+                                if (tail_uid == first_uid + test_count - 1) {
+                                    bonus += 10;
+                                } else if (tail_uid != 0 && tail_uid >= prev_uid && tail_uid < first_uid + kMaxCount) {
+                                    bonus += 2;
+                                }
+                            }
+                            if (uids_consecutive && sampled >= 2) bonus += 3;
+
+                            if (score > 0 || bonus >= 10) {
+                                results.push_back({offset, gap, test_count, s, score * 2 + bonus});
+                            }
                         }
                     }
                 }
 
-                
-                ScanResult* best = nullptr;
-                for (auto& res : results) {
-                    if (!best || res.score > best->score) best = &res;
-                }
+                std::sort(results.begin(), results.end(),
+                    [](const ScanResult& a, const ScanResult& b) { return a.score > b.score; });
 
-                if (best) {
-                    reader.seek(start_pos + best->offset + 8);
-                    dropped_items_count = best->count;
-                    uint32_t item_size = best->size;
-                    
-                    spdlog::info("Smart-Scan locked: count={}, size={}, offset={}", 
-                                 best->count, item_size, best->offset);
+                bool locked = false;
+                const size_t attempts = std::min<size_t>(results.size(), 12);
+                for (size_t attempt = 0; attempt < attempts && !locked; ++attempt) {
+                    const ScanResult& cand = results[attempt];
+                    size_t items_start = start_pos + cand.offset + 4 + cand.gap;
+                    reader.seek(items_start);
+                    dropped_items_count = cand.count;
+                    uint32_t item_size = cand.size;
 
+                    dropped_items.clear();
                     dropped_items.reserve(dropped_items_count);
+                    uint32_t parsed_nonzero = 0;
                     for (uint32_t i = 0; i < dropped_items_count; ++i) {
-                        if (reader.position() + 16 > size) break;
-                        
+                        if (reader.position() + item_size > size) break;
+
                         size_t item_start = reader.position();
                         DroppedItem item;
                         item.id    = reader.read<uint16_t>();
                         item.x     = reader.read<float>();
                         item.y     = reader.read<float>();
-                        
-                        if (item_size >= 19) {
+
+                        if (count_width(item_size) == 4) {
                             item.count = reader.read<uint32_t>();
+                        } else if (count_width(item_size) == 2) {
+                            item.count = reader.read<uint16_t>();
                         } else {
                             item.count = reader.read<uint8_t>();
                         }
-                        
-                        
-                        reader.seek(item_start + item_size - 4);
-                        item.uid = reader.read<uint32_t>();
-                        
-                        if (item.id != 0) dropped_items.push_back(item);
+
+                        reader.seek(item_start + uid_offset(item_size));
+                        item.uid = uid_width(item_size) == 4 ? reader.read<uint32_t>()
+                                                             : reader.read<uint16_t>();
+
+                        if (item.id != 0) {
+                            dropped_items.push_back(item);
+                            ++parsed_nonzero;
+                        }
                         reader.seek(item_start + item_size);
                     }
-                } else {
-                    spdlog::warn("Smart-Scan failed to find a valid items pattern");
+
+                    if (parsed_nonzero == 0) continue;
+
+                    // Record the allocator high-water mark that trails the list.
+                    if (reader.position() + 4 <= size) {
+                        last_dropped_item_uid = reader.read<uint32_t>();
+                    }
+
+                    spdlog::info("Smart-Scan locked: count={}, decoded={}, size={}, gap={}, offset={}, score={}",
+                                 cand.count, parsed_nonzero, item_size, cand.gap, cand.offset, cand.score);
+                    if (parsed_nonzero < dropped_items_count * 3 / 4) {
+                        spdlog::warn("Smart-Scan decoded {} of {} claimed items (possible format variant)",
+                                     parsed_nonzero, dropped_items_count);
+                    }
+                    locked = true;
                 }
-                
-                if (dropped_items.size() > 0) {
-                    spdlog::info("✓ Successfully parsed {} floating items", dropped_items.size());
+
+                if (!locked) {
+                    spdlog::warn("Smart-Scan found no valid dropped-items section ({} trailing bytes)",
+                                 remaining_bytes);
+                    dropped_items.clear();
+                    dropped_items_count = 0;
+                }
+
+                if (!dropped_items.empty()) {
+                    spdlog::info("Successfully parsed {} floating items", dropped_items.size());
                 }
             } catch (const std::exception& e) {
                 spdlog::debug("Dropped items section parse error: {}", e.what());

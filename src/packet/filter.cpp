@@ -109,7 +109,9 @@ Action ModifyTextMessageRule::process_packet(packet::NetMessageType type,
             
             
             std::string message;
-            data.read(message, data.get_size() - sizeof(packet::NetMessageType) - 1);
+            // Was get_size() - sizeof(NetMessageType) - 1, which under-read by one byte
+            // and dropped the last character of every message.
+            data.read(message, data.get_remaining());
             
             
             TextParse text_parse{message};

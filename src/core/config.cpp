@@ -7,15 +7,25 @@
 
 namespace core {
 static const std::map<std::string, ConfigStorage> config_defaults{
-    { "server.port", 16999 },
+    { "server.port", static_cast<unsigned int>(17091) },
     { "server.address", "www.growtopia1.com" },
-    { "client.game_version", "5.21" },
-    { "client.protocol", 312 },
+    { "client.game_version", "auto" },
+    { "client.protocol", static_cast<unsigned int>(0) },
+    { "client.version_override", std::string("") },
+    { "client.protocol_override", static_cast<unsigned int>(0) },
     { "client.dnsServer", "cloudflare" },
     { "extension.ignore", std::vector<std::string>{ "0xdeadbeef" } },
     { "log.printMessage", true },
     { "log.printGameUpdatePacket", false },
     { "log.printVariant", true },
+    // Mouse-aimed autopath: key is a Win32 virtual-key code (162 = VK_LCONTROL),
+    // mode is "auto" (walk if a path exists, else teleport), "walk" or "teleport";
+    // trigger is "click" (hold key + click, exact tile from the game client) or
+    // "hover" (press key while hovering, approximate camera-math tile).
+    { "command.autopath.enabled", true },
+    { "command.autopath.key", 162 },
+    { "command.autopath.mode", std::string("auto") },
+    { "command.autopath.trigger", std::string("click") },
     { "filter.rate_limit", 300 },
     { "filter.allow_burst", true },
     { "display.visual_name", "" },

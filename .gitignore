@@ -33,3 +33,19 @@ out/
 px.dat
 vd.dat
 locke_sightings.dat
+
+# Standalone test build artifacts
+/obj/
+*.obj
+test_parser.exe
+test_spawn.exe
+test_variant.exe
+test_items.exe
+test_items_edge.exe
+/tests/_*.exe
+/tests/_obj_*/
+
+# Secrets: never commit private keys. The proxy's MITM CA key is per-install;
+# generate it on first run instead of tracking it.
+resources/key.pem
+resources/cert.pem

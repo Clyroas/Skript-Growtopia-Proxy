@@ -45,12 +45,19 @@ public:
                     return;
                 }
 
-                std::ignore = core_->get_client()->connect(address_, port_);
+                // X6: a failed upstream connect used to be silently ignored and the
+                // client session hung with no upstream. Nothing to recover with
+                // here, but at least it is loud now.
+                if (core_->get_client()->connect(address_, port_) == nullptr) {
+                    spdlog::error("SubServerSwitch: upstream connect failed; client session has no upstream");
+                }
 
                 address_.clear();
                 port_ = -1;
 
-                evt.canceled = true;
+                // X6: the old cancel here was dead code - server.cpp intentionally
+                // ignores Connection.canceled. This flow never depended on it; the
+                // redirect above is the whole effect.
             }
         );
 
@@ -67,23 +74,59 @@ public:
                 }
 
                 const packet::Variant evt_variant{ evt.get_args() };
-                std::vector tokenize{ TextParse::tokenize(evt_variant.get(4)) };
+
+                if (evt_variant.size() < 5) {
+                    spdlog::warn("OnSendToServer: unexpected variant arity {} (expected >= 5); "
+                                 "leaving packet untouched", evt_variant.size());
+                    return;
+                }
+
+                std::vector<std::string> tokenize{ TextParse::tokenize(evt_variant.get(4)) };
+                if (tokenize.empty()) {
+                    spdlog::warn("OnSendToServer: variant[4] carried no tokens; leaving packet untouched");
+                    return;
+                }
 
                 address_ = tokenize.at(0);
-                port_ = evt_variant.get<int32_t>(1);
+                port_ = evt_variant.get_any_int(1).value_or(0);
+
+                if (address_.empty() || port_ <= 0) {
+                    spdlog::warn("OnSendToServer: could not derive a usable relay target "
+                                 "(address='{}', port={}); leaving packet untouched", address_, port_);
+                    address_.clear();
+                    port_ = -1;
+                    return;
+                }
 
                 packet::game::OnSendToServer packet{};
-                packet.port = core_->get_config().get<unsigned int>("server.port");
-                packet.token = evt_variant.get<int32_t>(2);
-                packet.user = evt_variant.get<int32_t>(3);
+                packet.port = core_->get_config().get<unsigned int>("server.port", 17091);
+
+                packet.token = evt_variant.get_any_int(2).value_or(0);
+                packet.user = evt_variant.get_any_int(3).value_or(0);
                 packet.address = "127.0.0.1";
-                packet.door_id = tokenize.size() == 2
-                    ? ""
-                    : tokenize.at(1);
-                packet.uuid_token = tokenize.size() == 2
-                    ? tokenize.at(1)
-                    : tokenize.at(2);
-                packet.login_mode = evt_variant.get<int32_t>(5);
+
+                
+                
+                
+                
+                
+                if (tokenize.size() == 1) {
+                    packet.door_id = "";
+                    packet.uuid_token = "";
+                }
+                else if (tokenize.size() == 2) {
+                    packet.door_id = "";
+                    packet.uuid_token = tokenize.at(1);
+                }
+                else {
+                    packet.door_id = tokenize.at(1);
+                    packet.uuid_token = tokenize.at(2);
+                }
+
+                // X21: index 5 is optional (older servers send 5 args); missing -> 0.
+                // get_any_int() is OOB-safe (nullopt), so no size>=6 check is needed.
+                packet.login_mode = static_cast<uint8_t>(evt_variant.get_any_int(5).value_or(0));
+
                 packet::PacketHelper::send(packet, evt.get_target());
                 evt.canceled = true;
             }

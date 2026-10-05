@@ -10,6 +10,8 @@
 #include "../packet/packet_types.hpp"
 #include "../packet/packet_variant.hpp"
 #include "../utils/byte_stream.hpp"
+#include "../utils/packet_limits.hpp"
+#include "../utils/enet_lock.hpp"
 #include "../utils/network.hpp"
 #include "../utils/api_client.hpp"
 #include "../utils/world_manager.hpp"
@@ -46,7 +48,10 @@ Server::Server(core::Core* core)
     , player_{ nullptr }
 {
     ENetAddress address{};
-    address.host = ENET_HOST_ANY;
+    if (enet_address_set_host(&address, "127.0.0.1") != 0) {
+        spdlog::error("Failed to resolve loopback address for the local proxy listener");
+        return;
+    }
     
     
     unsigned int port = 17091; 
@@ -57,7 +62,11 @@ Server::Server(core::Core* core)
     }
     address.port = port;
 
-    host_ = enet_host_create(&address, 1, 2, 0, 0);
+    // peerCount was 1, so a client that reconnects before the previous peer has timed
+    // out (which happens on every sub-server switch / relog) is refused by
+    // enet_host_accept with no free slot. Allow a few slots so overlap is harmless.
+    constexpr std::size_t kPeerSlots = 8;
+    host_ = enet_host_create(&address, kPeerSlots, 2, 0, 0);
     if (!host_) {
         spdlog::error("Failed to create server host on port {}", address.port);
         return;
@@ -75,6 +84,7 @@ Server::Server(core::Core* core)
 
 Server::~Server()
 {
+    clear_pending();
     if (host_) {
         enet_host_destroy(host_);
     }
@@ -91,25 +101,50 @@ void Server::process()
     }
 
     ENetEvent ev{};
-    while (enet_host_service(host_, &ev, 0) > 0) { 
+    // Bound each nonblocking pass so a busy local socket cannot monopolize the
+    // shared ENet lock or keep the upstream host from being serviced this tick.
+    constexpr std::size_t kMaxEventsPerPass = 128;
+    const net::ENetLock guard{ net::enet_traffic_mutex() };
+
+    std::size_t events_processed = 0;
+    while (events_processed < kMaxEventsPerPass && enet_host_service(host_, &ev, 0) > 0) {
+        ++events_processed;
         switch (ev.type) {
         case ENET_EVENT_TYPE_CONNECT:
             on_connect(ev.peer);
             break;
         case ENET_EVENT_TYPE_DISCONNECT:
+            spdlog::warn("[ENET] client-facing DISCONNECT event: peer={}:{} state={} (data={})",
+                         network::format_ip_address(ev.peer->address.host),
+                         ev.peer->address.port,
+                         static_cast<int>(ev.peer->state),
+                         static_cast<unsigned>(ev.data));
             on_disconnect(ev.peer);
             break;
         case ENET_EVENT_TYPE_RECEIVE:
+            spdlog::trace("[ENET] client-facing received {} bytes", ev.packet->dataLength);
             on_receive(ev.peer, ev.packet);
             break;
         default:
             break;
         }
     }
+
+    enet_host_flush(host_);
 }
 
 void Server::on_connect(ENetPeer* peer)
 {
+    // The proxy is intended for the local game client only. Do not rely on event
+    // listeners to reject remote peers: connection dispatch happens after ENet accepts
+    // them, and a remote peer must never replace the active local player.
+    if (peer->address.host != 0x0100007fU) { // 127.0.0.1 in ENet's address byte order
+        spdlog::warn("Rejecting non-loopback proxy connection from {}:{}",
+            network::format_ip_address(peer->address.host), peer->address.port);
+        enet_peer_disconnect_now(peer, 0);
+        return;
+    }
+
     spdlog::info(
         "Client connected to proxy: {}:{}",
         network::format_ip_address(peer->address.host),
@@ -119,12 +154,35 @@ void Server::on_connect(ENetPeer* peer)
     
     enet_peer_timeout(peer, 10000, 15000, 20000); 
 
+    // Retire the previous session's peer EXPLICITLY before replacing the player.
+    //
+    // Deleting player_ only drops our reference to the ENetPeer; the peer stayed alive
+    // in the host's peer array until its timeout expired. That was harmless while the
+    // host had exactly one peer slot (peerCount == 1), because a reconnect could not be
+    // accepted until the slot was free. Once the slot count was raised so that a
+    // reconnect is accepted immediately, stale peers could coexist with the live one,
+    // and any packet they still had queued was relayed to the NEW client - corrupting
+    // the login handshake. Disconnect the old peer so it cannot outlive its session.
     if (player_) {
         spdlog::warn("Another player is already connected, disconnecting previous");
+        if (ENetPeer* old_peer = player_->get_peer(); old_peer != nullptr && old_peer != peer) {
+            enet_peer_disconnect_now(old_peer, 0);
+        }
         delete player_;
+        player_ = nullptr;
+        // The game server does not answer a new handshake while this client's
+        // previous session is still open, so the old upstream link must die NOW -
+        // waiting for its timeout is exactly what made reconnect handshakes hang
+        // silently and turned relogging into a rate-limited retry storm.
+        core_->get_client()->on_local_disconnect();
     }
-    
+
+    // Login packets queued by a previous client session belong to that dead session;
+    // replaying them into the fresh one would corrupt its handshake.
+    clear_pending();
+
     player_ = new player::Player{ peer };
+    active_client_connect_id_ = peer->connectID;
 
     
     core::EventConnection event_connection{ *player_ };
@@ -146,44 +204,55 @@ void Server::on_receive(ENetPeer* peer, ENetPacket* packet)
         return;
     }
 
+    // Ignore anything arriving from a peer that is no longer the active session.
+    // With more than one peer slot a superseded connection can still deliver queued
+    // data; relaying that would inject a dead session's packets into the live client's
+    // login handshake.
+    if (player_->get_peer() != peer) {
+        spdlog::debug("Dropping packet from a superseded client peer");
+        enet_packet_destroy(packet);
+        return;
+    }
+
     
-    spdlog::debug("Server received {} bytes from client", packet->dataLength);
+    spdlog::trace("Server received {} bytes from client", packet->dataLength);
 
     
     const player::Player* to_player = core_->get_client()->get_player();
     
     
-    if (!to_player) {
-        spdlog::warn("Real server client not ready yet, queuing packet...");
-        
-        
-        for (int i = 0; i < 5; i++) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            to_player = core_->get_client()->get_player();
-            if (to_player) {
-                spdlog::info("Client connected after waiting {}ms", (i + 1) * 10);
-                break;
-            }
-        }
-        
         if (!to_player) {
-            spdlog::warn("Real server still not connected, dropping packet");
-            enet_packet_destroy(packet);
-            return; 
+            // Keep the packet and replay it once the upstream link completes
+            // (Client::on_connect -> flush_pending_from_client). This used to drop
+            // the packet after a 50 ms wait, which ate the client's login hello
+            // whenever the upstream handshake lost that race: the server then saw
+            // an empty session and the client hung and gave up. Queuing turns the
+            // race harmless.
+            constexpr std::size_t kMaxQueuedPackets = 32;
+            if (pending_from_client_.size() >= kMaxQueuedPackets) {
+                spdlog::warn("Upstream still not connected and pending queue full; dropping packet");
+                enet_packet_destroy(packet);
+                return;
+            }
+            pending_from_client_.push_back(packet);
+            return;
         }
-    }
 
     ByteStream<std::uint16_t> byte_stream{ reinterpret_cast<std::byte*>(packet->data), packet->dataLength };
     
     
-    if (byte_stream.get_size() < 4) {
+    if (byte_stream.get_size() < packet::kMinPacketSize) {
         spdlog::warn("Packet too small from client: {}", byte_stream.get_size());
         enet_packet_destroy(packet);
         return; 
     }
     
-    if (byte_stream.get_size() > 65536) { 
-        spdlog::warn("Packet too large from client: {}", byte_stream.get_size());
+    // Was 65536 (64 KiB), which silently dropped any larger client packet instead of
+    // forwarding it. Share the common ceiling so this cannot drift from the other
+    // directions again.
+    if (byte_stream.get_size() > packet::kMaxPacketSize) { 
+        spdlog::warn("Packet too large from client: {} bytes (limit {})",
+                     byte_stream.get_size(), packet::kMaxPacketSize);
         enet_packet_destroy(packet);
         return; 
     }
@@ -249,6 +318,31 @@ void Server::on_receive(ENetPeer* peer, ENetPacket* packet)
         
         
         std::string action = text_parse.get("action");
+
+        // Login forensics. A server-side "logon_fail" is otherwise indistinguishable
+        // from a proxy or version problem, because the credentials are opaque here.
+        // Log the shape of the login request (never the secret values) so a rejection
+        // can be attributed to the account/version rather than the relay.
+        if (action.rfind("login", 0) == 0 || action.rfind("logon", 0) == 0
+            || !text_parse.get(DEC("tankIDName"), 0).empty()) {
+            spdlog::info("[LOGIN] action='{}' fields={} bytes={}",
+                         action, text_parse.get_data().size(), message.size());
+            for (const char* key : { "platform", "game_version", "version", "protocol",
+                                     "deviceVersion", "country" }) {
+                const std::string value = text_parse.get(key, 0);
+                if (!value.empty()) {
+                    spdlog::info("[LOGIN]   {}={}", key, value);
+                }
+            }
+            const std::string name = text_parse.get(DEC("tankIDName"), 0);
+            if (!name.empty()) {
+                spdlog::info("[LOGIN]   tankIDName is present (value redacted)");
+            }
+            else {
+                spdlog::warn("[LOGIN]   tankIDName is MISSING from the login request");
+            }
+        }
+
         if (action == "join_request") {
             std::string name = text_parse.get("name");
             spdlog::info("[CLIENT-ACTION] join_request to: {}", name);
@@ -302,7 +396,7 @@ void Server::on_receive(ENetPeer* peer, ENetPacket* packet)
         
         if (printMessages) {
             spdlog::info("Incoming message from client:");
-            for (const auto& key_value : text_parse.get_key_values()) {
+            for (const auto& key_value : text_parse.get_redacted_key_values()) {
                 spdlog::info("  {}", key_value);
             }
         }
@@ -329,7 +423,7 @@ void Server::on_receive(ENetPeer* peer, ENetPacket* packet)
                 spdlog::warn("Failed to read game update packet header");
                 
                 ByteStream<std::uint16_t> original_stream{ byte_stream.get_data().data(), byte_stream.get_size() };
-                original_stream.skip(start_pos); 
+                original_stream.seek(start_pos); 
                 to_player->send_packet(original_stream.get_data(), 0);
                 return;
             }
@@ -344,14 +438,14 @@ void Server::on_receive(ENetPeer* peer, ENetPacket* packet)
                                     byte_stream.get_size() - byte_stream.get_read_offset());
                         
                         ByteStream<std::uint16_t> original_stream{ byte_stream.get_data().data(), byte_stream.get_size() };
-                        original_stream.skip(start_pos);
+                        original_stream.seek(start_pos);
                         to_player->send_packet(original_stream.get_data(), 0);
                         return;
                     }
                 } else {
                     spdlog::warn("Extended data too large (>{}): {}", 256 * 1024 * 1024, game_update_packet.data_size);
                     ByteStream<std::uint16_t> original_stream{ byte_stream.get_data().data(), byte_stream.get_size() };
-                    original_stream.skip(start_pos);
+                    original_stream.seek(start_pos);
                     to_player->send_packet(original_stream.get_data(), 0);
                     return;
                 }
@@ -487,7 +581,7 @@ void Server::on_receive(ENetPeer* peer, ENetPacket* packet)
                 spdlog::error("Error in game packet event: {}", e.what());
                 
                 ByteStream<std::uint16_t> original_stream{ byte_stream.get_data().data(), byte_stream.get_size() };
-                original_stream.skip(start_pos);
+                original_stream.seek(start_pos);
                 to_player->send_packet(original_stream.get_data(), 0);
             }
         } catch (const std::exception& e) {
@@ -529,6 +623,17 @@ void Server::on_disconnect(ENetPeer* peer)
         peer->address.port
     );
 
+    // With multiple peer slots, a DISCONNECT event can arrive for a peer that was
+    // superseded (replaced in on_connect) or rejected while no player existed. ENet
+    // also recycles peer objects once their slot is freed. Only the peer of the
+    // current session - same object AND same connectID - may end it.
+    if (player_ && (player_->get_peer() != peer ||
+                    peer->connectID != active_client_connect_id_)) {
+        spdlog::warn("[ENET] Ignoring disconnect event for a superseded client peer {}:{}",
+                     network::format_ip_address(peer->address.host), peer->address.port);
+        return;
+    }
+
     if (!player_) {
         return;
     }
@@ -544,18 +649,48 @@ void Server::on_disconnect(ENetPeer* peer)
     
     utils::APIClient::set_online_connected(false);
 
-    
-    const player::Player* to_player = core_->get_client()->get_player();
-    if (to_player) {
-        spdlog::info("Also disconnecting from real server");
-        to_player->disconnect_now();
-    }
+    // The local client is gone (quit or dropped): tear the upstream side down too and
+    // drop the stale upstream player object. This used to only disconnect the peer,
+    // leaving Client::player_ alive wrapping a dead peer whose slot ENet then reused
+    // for the next session - so a lingering peer's disconnect event could match the
+    // stale object and kill the fresh session the moment it connected. That was the
+    // "disconnect right after connecting, worse in crowded worlds" loop.
+    core_->get_client()->on_local_disconnect();
 
     delete player_;
     player_ = nullptr;
-    
+    active_client_connect_id_ = 0;
+
+    clear_pending();
+
     if (host_) {
+        const net::ENetLock guard{ net::enet_traffic_mutex() };
         enet_host_flush(host_);
     }
+}
+
+void Server::flush_pending_from_client()
+{
+    // Called from Client::on_connect while the shared ENet traffic lock is held, the
+    // same lock that guards on_receive, so the deque needs no separate mutex.
+    while (!pending_from_client_.empty()) {
+        ENetPeer* peer = player_ ? player_->get_peer() : nullptr;
+        if (!peer) {
+            // The upstream link went away again; keep the rest queued for the next
+            // connect attempt.
+            return;
+        }
+        ENetPacket* packet = pending_from_client_.front();
+        pending_from_client_.pop_front();
+        on_receive(peer, packet);
+    }
+}
+
+void Server::clear_pending()
+{
+    for (ENetPacket* packet : pending_from_client_) {
+        enet_packet_destroy(packet);
+    }
+    pending_from_client_.clear();
 }
 }

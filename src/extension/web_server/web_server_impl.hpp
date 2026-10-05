@@ -6,22 +6,38 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
+#include <thread>
+#include <utility>
 
 #include "web_server.hpp"
+#include "../../utils/client_info.hpp"
+#include "../../utils/server_data_parser.hpp"
 #include "../../utils/strenc.hpp"
 #include "../../client/client.hpp"
 #include "../../core/core.hpp"
-#include "../../core/logger.hpp"
 #include "../../utils/network.hpp"
-#include "../../utils/text_parse.hpp"
 
 namespace extension::web_server {
 class WebServerExtension final : public IWebServerExtension {
     core::Core* core_;
     httplib::SSLServer server_;
 
+    // X4: written by the HTTPS route thread, consumed by the relay thread Connection
+    // listener. The old unsynchronised read+clear vs write was a data race on a
+    // std::string. Always touch under upstream_mutex_.
     std::string address_;
     uint16_t port_;
+    mutable std::mutex upstream_mutex_;
+    // X20: the HTTPS loop thread. Joined in free() - never detached (a detached
+    // thread could still run route handlers using this after delete).
+    std::thread server_thread_;
+
+    std::string declared_version_;
+    std::string declared_protocol_;
+    bool declaration_logged_{ false };
+    // mutable: client_declaration() is const but still needs to take the lock
+    mutable std::mutex declaration_mutex_;
 
 public:
     explicit WebServerExtension(core::Core* core)
@@ -46,23 +62,34 @@ public:
                     return;
                 }
 
-                
-                if (evt.get_player().get_peer()->address.host != 16777343) {
-                    spdlog::info("Security alert: External connection attempt blocked");
-                    return;
+                // X6: no loopback check here - Server::on_connect already drops
+                // non-loopback peers before dispatch, so this listener only ever
+                // sees 127.0.0.1. NOTE: setting evt.canceled on a Connection event
+                // has no effect (server.cpp intentionally ignores it); the old
+                // cancels here were dead code. Do not reject from this listener.
+
+                // X4: consume the pending upstream under the mutex (see members).
+                std::string address;
+                uint16_t port = 65535;
+                {
+                    std::lock_guard<std::mutex> lock(upstream_mutex_);
+                    if (address_.empty() || port_ == 65535) {
+                        return;
+                    }
+                    address = address_;
+                    port = port_;
+                    address_.clear();
+                    port_ = 65535;
                 }
 
-                if (address_.empty() || port_ == 65535) {
-                    return;
+                // X6: a failed upstream connect used to be silently ignored and the
+                // client session hung with no upstream. Nothing to recover with
+                // here, but at least it is loud now.
+                if (core_->get_client()->connect(address, port) == nullptr) {
+                    spdlog::error("Upstream connect failed; client session has no upstream");
                 }
-
-                std::ignore = core_->get_client()->connect(address_, port_);
-                evt.canceled = true;
-
-                address_.clear();
-                port_ = 65535;
             }
-        );
+        )
 
         
         check_ca_certificate();
@@ -114,17 +141,23 @@ public:
             res.set_content(error_response.dump(), "application/json");
         });
 
-        if (!server_.bind_to_port("0.0.0.0", 443)) {
-            spdlog::info("HTTPS server failed to bind to port 443");
+        if (!server_.bind_to_port("127.0.0.1", 443)) {
+            spdlog::error("HTTPS server failed to bind to port 443 - the server_data proxy chain is dead");
             return;
         }
 
         spdlog::trace("HTTPS server initialized on port 443");
-        std::thread{ &WebServerExtension::listen_internal, this }.detach();
+        server_thread_ = std::thread{ &WebServerExtension::listen_internal, this };
     }
 
     void free() override
     {
+        // X20: stop the HTTPS loop and JOIN the listener thread before delete this
+        // (route lambdas capture this; the old .detach() was a shutdown UAF).
+        server_.stop();
+        if (server_thread_.joinable()) {
+            server_thread_.join();
+        }
         delete this;
     }
 
@@ -161,8 +194,16 @@ private:
     }
 
     
-    std::unique_ptr<httplib::SSLClient> create_ssl_client(const std::string& host) {
+    std::unique_ptr<httplib::SSLClient> create_ssl_client(
+        const std::string& host,
+        const std::string& resolved_address = {}) {
         auto cli = std::make_unique<httplib::SSLClient>(host);
+        if (!resolved_address.empty()) {
+            // Connect to the DoH-resolved IP while keeping the original hostname for
+            // SNI and certificate hostname verification. Constructing SSLClient with
+            // the IP makes valid domain certificates fail verification.
+            cli->set_hostname_addr_map({ { host, resolved_address } });
+        }
         cli->set_connection_timeout(10);
         cli->set_read_timeout(30);
         cli->set_write_timeout(10);
@@ -178,6 +219,118 @@ private:
         cli->enable_server_certificate_verification(true);
         
         return cli;
+    }
+
+    
+    
+    void record_client_declaration(const httplib::Request& req)
+    {
+        utils::ClientDeclaration declaration{
+            utils::parse_client_declaration(req.body)
+        };
+
+        if (declaration.version.empty() && declaration.protocol.empty()) {
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(declaration_mutex_);
+
+        const bool version_changed{
+            !declaration.version.empty() && declaration.version != declared_version_
+        };
+        const bool protocol_changed{
+            !declaration.protocol.empty() && declaration.protocol != declared_protocol_
+        };
+
+        if (declaration.version.empty()) {
+            declaration.version = declared_version_;
+        }
+        if (declaration.protocol.empty()) {
+            declaration.protocol = declared_protocol_;
+        }
+
+        if (!declaration_logged_) {
+            spdlog::info("Growtopia client declared version={} protocol={} platform={}",
+                declaration.version.empty() ? "?" : declaration.version,
+                declaration.protocol.empty() ? "?" : declaration.protocol,
+                declaration.platform.empty() ? "?" : declaration.platform);
+            declaration_logged_ = true;
+        }
+
+        declared_version_ = declaration.version;
+        declared_protocol_ = declaration.protocol;
+
+        if (version_changed) {
+            core_->get_config().set<std::string>("client.game_version", declared_version_);
+        }
+        if (protocol_changed) {
+            try {
+                const int protocol{ std::stoi(declared_protocol_) };
+                if (protocol > 0) {
+                    core_->get_config().set<unsigned int>(
+                        "client.protocol", static_cast<unsigned int>(protocol));
+                }
+            }
+            catch (const std::exception&) {
+                spdlog::warn("Client declared non-numeric protocol \"{}\"", declared_protocol_);
+            }
+        }
+    }
+
+    
+    
+    void report_server_data_failure(httplib::Response& res,
+                                    const std::string& response_body,
+                                    const std::string& target_server)
+    {
+        const std::string preview{ make_preview(response_body) };
+
+        const auto [version, protocol] = client_declaration();
+
+        spdlog::error("Growtopia rejected the login request (client version={} protocol={})",
+            version.empty() ? "unknown" : version,
+            protocol.empty() ? "unknown" : protocol);
+        spdlog::error("Upstream {} replied: {}", target_server,
+            preview.empty() ? "<empty body>" : preview);
+
+        res.status = 502;
+        res.set_content(
+            "Growtopia did not return a usable server_data.php response.\n"
+            "Client version : " + (version.empty() ? std::string{ "unknown" } : version) + "\n"
+            "Client protocol: " + (protocol.empty() ? std::string{ "unknown" } : protocol) + "\n"
+            "Upstream reply : " + (preview.empty() ? std::string{ "<empty>" } : preview) + "\n",
+            "text/plain"
+        );
+    }
+
+    [[nodiscard]] std::pair<std::string, std::string> client_declaration() const
+    {
+        std::lock_guard<std::mutex> lock(declaration_mutex_);
+        return { declared_version_, declared_protocol_ };
+    }
+
+    static std::string make_preview(const std::string& body)
+    {
+        constexpr std::size_t max_preview{ 400 };
+
+        std::string preview{};
+        preview.reserve(std::min(body.size(), max_preview));
+
+        for (const char ch : body) {
+            if (preview.size() >= max_preview) {
+                preview += "...";
+                break;
+            }
+
+            if (ch == '\n' || ch == '\r' || ch == '\t') {
+                preview += ' ';
+            }
+            else if (static_cast<unsigned char>(ch) >= 0x20) {
+                preview += ch;
+            }
+        }
+
+        return preview;
     }
 
     std::string resolve_domain_name(const std::string& domain_name)
@@ -216,6 +369,37 @@ private:
         }
     }
 
+    
+    [[nodiscard]] std::string build_upstream_body(const std::string& client_body) const
+    {
+        const std::string version_override{
+            core_->get_config().get<std::string>("client.version_override", "")
+        };
+
+        const unsigned int protocol_override{
+            core_->get_config().get<unsigned int>("client.protocol_override", 0u)
+        };
+
+        if (version_override.empty() && protocol_override == 0) {
+            return client_body;
+        }
+
+        std::string body{ client_body };
+
+        if (!version_override.empty()) {
+            body = utils::set_form_field(body, "version", version_override);
+        }
+        if (protocol_override != 0) {
+            body = utils::set_form_field(body, "protocol", std::to_string(protocol_override));
+        }
+
+        spdlog::warn("Overriding client declaration sent upstream (version={} protocol={})",
+            version_override.empty() ? "<client>" : version_override,
+            protocol_override == 0 ? "<client>" : std::to_string(protocol_override));
+
+        return body;
+    }
+
     void listen_internal()
     {
         
@@ -229,9 +413,8 @@ private:
             res.set_header("X-XSS-Protection", "1; mode=block");
             res.set_header("Strict-Transport-Security", "max-age=31536000");
 
-            std::string target_server = resolve_domain_name(
-                core_->get_config().get("server.address")
-            );
+            const std::string target_hostname{ core_->get_config().get("server.address") };
+            const std::string target_server{ resolve_domain_name(target_hostname) };
 
             if (target_server.empty()) {
                 res.status = 502;
@@ -240,46 +423,30 @@ private:
             }
 
             spdlog::info("Connecting to Growtopia server: {}", target_server);
+
+            record_client_declaration(req);
+
             
+            const std::string upstream_body{ build_upstream_body(req.body) };
+
             bool connection_success = false;
             std::string response_body;
             
             
             {
-                auto cli = create_ssl_client(target_server);
+                auto cli = create_ssl_client(target_hostname, target_server);
                 auto result = cli->Post("/growtopia/server_data.php", 
                     {{ "User-Agent", req.get_header_value("User-Agent") },
                      { "Host", core_->get_config().get("server.address") },
                      { "Content-Type", "application/x-www-form-urlencoded" }},
-                    req.body, "application/x-www-form-urlencoded");
+                    upstream_body, "application/x-www-form-urlencoded");
                 
                 if (validate_server_response(result)) {
                     connection_success = true;
                     response_body = result->body;
                     spdlog::info("Successfully connected using SSL verification");
                 } else {
-                    spdlog::warn("SSL verification failed, trying without verification...");
-                }
-            }
-            
-            
-            if (!connection_success) {
-                spdlog::warn("Trying without SSL verification...");
-                httplib::SSLClient cli{ target_server };
-                cli.set_connection_timeout(5);
-                cli.set_read_timeout(15);
-                cli.enable_server_certificate_verification(false);  
-                
-                auto result = cli.Post("/growtopia/server_data.php", 
-                    {{ "User-Agent", req.get_header_value("User-Agent") },
-                     { "Host", core_->get_config().get("server.address") },
-                     { "Content-Type", "application/x-www-form-urlencoded" }},
-                    req.body, "application/x-www-form-urlencoded");
-                
-                if (validate_server_response(result)) {
-                    connection_success = true;
-                    response_body = result->body;
-                    spdlog::warn("Connected without SSL verification (INSECURE)");
+                    spdlog::warn("Verified upstream HTTPS request failed; refusing an unverified retry");
                 }
             }
             
@@ -291,26 +458,72 @@ private:
             }
 
             try {
-                TextParse text_parse{ response_body };
-                if (text_parse.empty()) {
-                    res.status = 502;
-                    res.set_content("Invalid server response", "text/plain");
+                
+                
+                utils::ServerDataParser server_data{ response_body };
+
+                
+                
+                if (!server_data.has_field("server") || server_data.get("server").empty()) {
+                    report_server_data_failure(res, response_body, target_server);
                     return true;
                 }
 
-                
-                address_ = text_parse.get("server");
-                port_ = std::stoi(text_parse.get("port"));
+                const std::optional<unsigned int> upstream_port{
+                    utils::parse_port(server_data.get("port"))
+                };
+
+                if (!upstream_port) {
+                    report_server_data_failure(res, response_body, target_server);
+                    return true;
+                }
+
+                {
+                    std::lock_guard<std::mutex> lock(upstream_mutex_);
+                    address_ = server_data.get("server");
+                    port_ = static_cast<uint16_t>(*upstream_port);
+                }
 
                 
-                text_parse.set("server", { "127.0.0.1" });
-                text_parse.set("port", { 
-                    std::to_string(core_->get_config().get<unsigned int>("server.port")) 
-                });
-                text_parse.set("type2", { "1" });
+                
+                
+                
+                
+                
+                
+                server_data.set("server", "127.0.0.1");
+                server_data.set("port", std::to_string(
+                    core_->get_config().get<unsigned int>("server.port", 17091)
+                ));
 
-                res.set_content(text_parse.get_raw(), "text/html");
-                spdlog::info("Successfully proxied request to Growtopia");
+                
+                if (server_data.has_field("beta_server")) {
+                    server_data.set("beta_server", "127.0.0.1");
+                }
+                if (server_data.has_field("beta_port")) {
+                    server_data.set("beta_port", std::to_string(
+                        core_->get_config().get<unsigned int>("server.port", 17091)
+                    ));
+                }
+                if (server_data.has_field("type2")) {
+                    server_data.set("type2", "1");
+                }
+
+                res.set_content(server_data.serialize(), "text/html");
+
+                const auto [version, protocol] = client_declaration();
+                std::string logged_address;
+                uint16_t logged_port = 0;
+                {
+                    std::lock_guard<std::mutex> lock(upstream_mutex_);
+                    logged_address = address_;
+                    logged_port = port_;
+                }
+                spdlog::info("Proxied server_data.php -> {}:{} (client version {}, protocol {})",
+                    logged_address,
+                    logged_port,
+                    version.empty() ? "unknown" : version,
+                    protocol.empty() ? "unknown" : protocol);
                 return true;
             }
             catch (const std::exception& e) {
@@ -338,15 +551,6 @@ private:
         });
 
         
-        server_.Get("/logs", [](const httplib::Request&, httplib::Response& res) {
-            auto logs = core::Logger::read_log_file();
-            nlohmann::json log_data = {
-                {"logs", logs},
-                {"count", logs.size()}
-            };
-            res.set_content(log_data.dump(), "application/json");
-        });
-
         spdlog::trace("HTTP server endpoints registered");
         server_.listen_after_bind();
     }

@@ -204,7 +204,7 @@ static void pulse_vend_marker(const std::string& target_world, uint32_t x, uint3
 }
 
 VendLocCommand::VendLocCommand() : CommandBase(
-    {"vendf", "vendloc"},
+    {"vendf", "vendloc", "vendfind"},
     {},
     "Search for items in vending machines",
     0
@@ -242,8 +242,14 @@ void VendLocCommand::execute(client::Client* client, const std::vector<std::stri
         return;
     }
 
+    std::string query;
+    for (std::size_t i = 1; i < args.size(); ++i) {
+        if (!query.empty()) query += ' ';
+        query += args[i];
+    }
+
     VendLocCommand cmd;
-    cmd.show_search_gui(server->get_player(), "");
+    cmd.show_search_gui(server->get_player(), query);
 }
 
 void VendLocCommand::save_world_vendings(const world_v2::World& world) {
@@ -260,7 +266,8 @@ void VendLocCommand::save_world_vendings(const world_v2::World& world) {
     std::unordered_map<std::string, VendingEntry> by_pos;
     
     for (const auto& tile : world.tiles) {
-        if ((tile.fg == 2978 || tile.fg == 9268) && tile.vending_data.has_data()) {
+        if ((tile.is_vending() || tile.fg == 2978 || tile.fg == 9268) &&
+            tile.vending_data.has_data()) {
             VendingEntry entry;
             entry.world_name = world.name;
             entry.timestamp = timestamp;

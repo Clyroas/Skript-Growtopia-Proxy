@@ -19,6 +19,7 @@
 #include <regex>
 #include <unordered_set>
 #include <unordered_map>
+#include <vector>
 #include "../../utils/inventory_manager.hpp"
 #include "../command_handler/dat_command.hpp"
 #include "../command_handler/dropall_command.hpp"
@@ -55,6 +56,22 @@ class ParserExtension final : public IParserExtension {
     mutable std::uint32_t tick_counter_ = 0;
     bool pending_balance_on_inventory_ = false;
     std::unordered_set<std::string> auto_ignored_names_;
+    // X7/X11/X12: deferred sends. Automation that needs a delay used to either sleep()
+    // on the relay thread (stalling the whole proxy) or fire detached threads
+    // (check-then-send race on the player object, `this` captured across free()).
+    // Servicing and Tick all run on the one Core::run() thread, so a Tick-flushed
+    // queue gives the same timing with no threads and no races.
+    struct DeferredSend {
+        enum class Kind { UpstreamText, ClientChat, DisplayApply };
+        Kind kind = Kind::UpstreamText;
+        std::chrono::steady_clock::time_point due{};
+        std::string payload;
+        int32_t display_net_id = 0;
+        std::string display_name;
+        int repeats_left = 1;
+        int repeat_interval_ms = 0;
+    };
+    std::vector<DeferredSend> deferred_sends_;
     std::unordered_map<std::string, std::chrono::steady_clock::time_point> recent_real_spins_;
     std::unordered_map<int, std::chrono::steady_clock::time_point> recent_real_spin_values_;
     std::unordered_map<std::string, std::chrono::steady_clock::time_point> recent_fake_spins_;
@@ -90,6 +107,7 @@ public:
             core::EventType::Tick,
             [this](const core::EventTick& event) {
                 tick_counter_++;
+                flush_deferred_sends();
                 
                 if (core_->get_config().get<bool>("display.show_ping") && (tick_counter_ % 60 == 0)) {
                     utils::DisplayManager::update_display(core_);
@@ -182,6 +200,81 @@ public:
     }
 
 private:
+    void defer_upstream_text(std::string payload, int delay_ms, int repeats = 1, int interval_ms = 0) {
+        DeferredSend item;
+        item.kind = DeferredSend::Kind::UpstreamText;
+        item.due = std::chrono::steady_clock::now() + std::chrono::milliseconds(delay_ms);
+        item.payload = std::move(payload);
+        item.repeats_left = repeats;
+        item.repeat_interval_ms = interval_ms;
+        if (deferred_sends_.size() >= 256) {
+            spdlog::warn("Deferred send queue full, dropping oldest entry");
+            deferred_sends_.erase(deferred_sends_.begin());
+        }
+        deferred_sends_.push_back(std::move(item));
+    }
+
+    void defer_client_chat(std::string message, int delay_ms) {
+        DeferredSend item;
+        item.kind = DeferredSend::Kind::ClientChat;
+        item.due = std::chrono::steady_clock::now() + std::chrono::milliseconds(delay_ms);
+        item.payload = std::move(message);
+        deferred_sends_.push_back(std::move(item));
+    }
+
+    void defer_display_apply(int32_t net_id, std::string name, int delay_ms) {
+        DeferredSend item;
+        item.kind = DeferredSend::Kind::DisplayApply;
+        item.due = std::chrono::steady_clock::now() + std::chrono::milliseconds(delay_ms);
+        item.display_net_id = net_id;
+        item.display_name = std::move(name);
+        deferred_sends_.push_back(std::move(item));
+    }
+
+    void flush_deferred_sends() {
+        if (deferred_sends_.empty() || !core_) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        for (auto it = deferred_sends_.begin(); it != deferred_sends_.end(); ) {
+            if (now < it->due) {
+                ++it;
+                continue;
+            }
+            switch (it->kind) {
+                case DeferredSend::Kind::UpstreamText: {
+                    auto* client = core_->get_client();
+                    if (client && client->get_player()) {
+                        ByteStream<std::uint16_t> bs{};
+                        bs.write(packet::NET_MESSAGE_GENERIC_TEXT);
+                        bs.write(it->payload, false);
+                        client->get_player()->send_packet(bs.get_data(), 0);
+                    }
+                    break;
+                }
+                case DeferredSend::Kind::ClientChat: {
+                    auto* server = core_->get_server();
+                    if (server && server->get_player()) {
+                        utils::PacketUtils::send_chat_message(server->get_player(), it->payload, false);
+                    }
+                    break;
+                }
+                case DeferredSend::Kind::DisplayApply: {
+                    spdlog::info("[OnSpawn] Applying display settings now (netID: {})", it->display_net_id);
+                    utils::DisplayManager::apply_display_name(core_, it->display_net_id, it->display_name);
+                    spdlog::info("[OnSpawn] Display settings applied successfully");
+                    break;
+                }
+            }
+            if (--it->repeats_left > 0 && it->repeat_interval_ms > 0) {
+                it->due = now + std::chrono::milliseconds(it->repeat_interval_ms);
+                ++it;
+            } else {
+                it = deferred_sends_.erase(it);
+            }
+        }
+    }
+
     void parse_connection_info(const core::EventMessage& event) {
         if (event.from != core::EventFrom::FromClient) {
             return;
@@ -221,24 +314,19 @@ private:
                         mac_msg,
                         false
                     );
-                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
                 }
 
                 
+                // X7: paced +50ms via the Tick queue instead of sleeping the relay thread.
                 if (!user_id.empty()) {
                     std::string user_msg = fmt::format(
                         "`2UserID: `9{}",
                         user_id
                     );
-                    utils::PacketUtils::send_chat_message(
-                        const_cast<player::Player*>(&event.get_player()), 
-                        user_msg,
-                        false
-                    );
-                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    defer_client_chat(user_msg, 50);
                 }
 
-                
+
                 auto& inv_mgr = utils::InventoryManager::get_instance();
                 int wl = inv_mgr.get_item_count(242);
                 int dl = inv_mgr.get_item_count(1796);
@@ -247,12 +335,10 @@ private:
                 
                 
                 std::string balance_msg = fmt::format("`2Balance: `w{} ā ({} DL, {} BGL))", total_wl, dl, bgl);
-                utils::PacketUtils::send_chat_message(
-                    const_cast<player::Player*>(&event.get_player()),
-                    balance_msg,
-                    false
-                );
-                spdlog::info("[BALANCE-CONSOLE] Sent balance message to chat: {} WL ({} DL, {} BGL)", total_wl, dl, bgl);
+                // X7: paced +100ms via the Tick queue instead of sleeping the relay thread.
+                defer_client_chat(balance_msg, 100);
+
+                spdlog::info("[BALANCE-CONSOLE] Queued balance message (+100ms) for chat: {} WL ({} DL, {} BGL)", total_wl, dl, bgl);
             }
 
             
@@ -637,7 +723,7 @@ private:
                                 }
                             }
                         } catch (...) {}
-                        spdlog::info("`2[Double Jump]`` Auto-enabled for player");
+                        spdlog::info("[Double Jump] Auto-enabled for player"); // X23: no GT color codes in terminal logs
                         core_->get_config().set("features.double_jump", true);
                         spdlog::debug("Double jump config set to: {}", core_->get_config().get<bool>("features.double_jump"));
                         
@@ -1124,7 +1210,7 @@ private:
                 int tile_x = static_cast<int>(tank->vec_x / 32.0f);
                 int tile_y = static_cast<int>(tank->vec_y / 32.0f);
                 
-                spdlog::info("[YOUR POSITION] Tile: ({}, {}) | Pixels: ({:.0f}, {:.0f})", 
+                spdlog::trace("[YOUR POSITION] Tile: ({}, {}) | Pixels: ({:.0f}, {:.0f})", 
                             tile_x, tile_y, tank->vec_x, tank->vec_y);
                 
                 
@@ -1149,14 +1235,14 @@ private:
                 auto local_player = tracker.get_local_player();
                 
                 if (local_player.netID > 0 && static_cast<uint32_t>(tank->net_id) != local_player.netID) {
-                    spdlog::debug("[OTHER PLAYER {}] Tile: ({}, {}) | Pixels: ({:.0f}, {:.0f})", 
+                    spdlog::trace("[OTHER PLAYER {}] Tile: ({}, {}) | Pixels: ({:.0f}, {:.0f})", 
                                  tank->net_id, tile_x, tile_y, tank->vec_x, tank->vec_y);
                 }
                 
                 tracker.update_player_position(tank->net_id, tank->vec_x, tank->vec_y);
             } else {
                 
-                spdlog::debug("[STATE PACKET] NetID: {} has no position data (size: {})", 
+                spdlog::trace("[STATE PACKET] NetID: {} has no position data (size: {})", 
                              game_packet.net_id, ext_data.size());
             }
         }
@@ -1192,15 +1278,15 @@ private:
                                     
                                     if (local_player.netID == 0) {
                                         
-                                        spdlog::info("[POSITION DEBUG] Player netID {} at X: {} Y: {} (local player not initialized yet)", 
+                                        spdlog::trace("[POSITION DEBUG] Player netID {} at X: {} Y: {} (local player not initialized yet)", 
                                                     game_packet.net_id, tile_x, tile_y);
                                     } else if (local_player.netID == game_packet.net_id) {
                                         
-                                        spdlog::info("[PLAYER POSITION] X: {} Y: {} (pixels: {:.0f}, {:.0f})", 
+                                        spdlog::trace("[PLAYER POSITION] X: {} Y: {} (pixels: {:.0f}, {:.0f})", 
                                                     tile_x, tile_y, pos.x, pos.y);
                                     } else {
                                         
-                                        spdlog::debug("[OTHER PLAYER {}] X: {} Y: {}", game_packet.net_id, tile_x, tile_y);
+                                        spdlog::trace("[OTHER PLAYER {}] X: {} Y: {}", game_packet.net_id, tile_x, tile_y);
                                     }
                                 }
                             }
@@ -1397,8 +1483,18 @@ private:
                 } catch (...) {}
             }
 
-            spdlog::info("Incoming variant from {}:", event.from == core::EventFrom::FromClient ? "client" : "server");
+            const bool is_position_update = !variants.empty()
+                && packet::Variant::get_type(variants.front()) == packet::VariantType::STRING
+                && std::get<std::string>(variants.front()) == "OnSetPos";
+            if (!is_position_update) {
+                spdlog::info("Incoming variant from {}:", event.from == core::EventFrom::FromClient ? "client" : "server");
+            }
             for (size_t i = 0; i < variants.size(); ++i) {
+                // OnSetPos arrives repeatedly for every moving player. Its values are
+                // already tracked above; omit the per-field diagnostic spam here.
+                if (is_position_update) {
+                    break;
+                }
                 try {
                     switch (packet::Variant::get_type(variants[i])) {
                     case packet::VariantType::FLOAT:
@@ -1415,14 +1511,14 @@ private:
                         try {
                             TextParse text_parse{ str_val };
                             if (!text_parse.empty()) {
-                                std::vector key_values{ text_parse.get_key_values() };
+                                std::vector key_values{ text_parse.get_redacted_key_values() };
                                 if (key_values.size() == 1) {
                                     spdlog::info("[SERVER] {}", key_values[0]);
                                     break;
                                 }
 
                                 spdlog::info("[SERVER]");
-                                for (const auto& key_value : text_parse.get_key_values()) {
+                                for (const auto& key_value : text_parse.get_redacted_key_values()) {
                                     spdlog::info("{}", key_value);
                                 }
                                 break;
@@ -1439,7 +1535,9 @@ private:
                     case packet::VariantType::VEC2:
                         {
                             const glm::vec2 vec2{ std::get<glm::vec2>(variants[i]) };
-                            spdlog::info("[POSITION] X: {}, Y: {}", vec2.x, vec2.y);
+                            if (!is_position_update) {
+                                spdlog::info("[POSITION] X: {}, Y: {}", vec2.x, vec2.y);
+                            }
                             
                             
                             if (variant.size() > 0) {
@@ -1542,14 +1640,8 @@ private:
                                             saved_name, show_ping, has_g4g, has_maxlevel, has_dr, has_mentor);
                                 
                                 
-                                std::thread([this, netID, name]() {
-                                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                                    if (core_) {
-                                        spdlog::info("[OnSpawn] Applying display settings now (netID: {})", netID);
-                                        utils::DisplayManager::apply_display_name(core_, netID, name);
-                                        spdlog::info("[OnSpawn] Display settings applied successfully");
-                                    }
-                                }).detach();
+                                // X11/X12: was a detached thread capturing `this` (shutdown UAF); Tick-deferred now.
+                                defer_display_apply(netID, name, 500);
                             }
                         } else {
                             spdlog::debug("Tracked spawned player: netID={}, name='{}', platformID='{}'",
@@ -1567,6 +1659,10 @@ private:
                         bool wrench_auto_pull = false;
                         bool wrench_auto_kick = false;
                         bool wrench_auto_ban = false;
+                        // X17: compiled once, not on every dialog on the relay thread.
+                        static const std::regex kItemIdRe("embed_data\\|itemID\\|([0-9]+)");
+                        static const std::regex kCountRe("add_text_input\\|count\\|\\|([0-9]*)");
+                        static const std::regex kHaveRe("you have ([0-9]+)");
                         try { wrench_auto_pull = core_->get_config().get<bool>("features.wrench.auto_pull"); } catch (...) {}
                         try { wrench_auto_kick = core_->get_config().get<bool>("features.wrench.auto_kick"); } catch (...) {}
                         try { wrench_auto_ban = core_->get_config().get<bool>("features.wrench.auto_ban"); } catch (...) {}
@@ -1580,9 +1676,9 @@ private:
                             if (command::DropFastCommand::is_enabled()) {
                                 std::string item_id, count;
                                 std::smatch m;
-                                if (std::regex_search(dialog_content, m, std::regex("embed_data\\|itemID\\|([0-9]+)")))
+                                if (std::regex_search(dialog_content, m, kItemIdRe))
                                     item_id = m[1].str();
-                                if (std::regex_search(dialog_content, m, std::regex("add_text_input\\|count\\|\\|([0-9]*)")))
+                                if (std::regex_search(dialog_content, m, kCountRe))
                                     count = m[1].str();
                                 if (!item_id.empty()) {
                                     std::string resp;
@@ -1595,16 +1691,9 @@ private:
                                         resp = "action|dialog_return\ndialog_name|drop_item\nitemID|" + item_id + "|\nbuttonClicked|yes";
                                         spdlog::info("DropFast: auto-confirmed warning dialog itemID={}", item_id);
                                     }
-                                    core::Core* core = core_;
-                                    std::thread([core, resp]() {
-                                        std::this_thread::sleep_for(std::chrono::milliseconds(150));
-                                        if (core && core->get_client() && core->get_client()->get_player()) {
-                                            ByteStream<std::uint16_t> bs{};
-                                            bs.write(packet::NET_MESSAGE_GENERIC_TEXT);
-                                            bs.write(resp, false);
-                                            core->get_client()->get_player()->send_packet(bs.get_data(), 0);
-                                        }
-                                    }).detach();
+                                    // X11: was a detached thread (check-then-send race on the player object).
+                                    // Tick-deferred now - same 150ms, no thread.
+                                    defer_upstream_text(resp, 150);
                                     const_cast<core::EventPacket&>(event).canceled = true;
                                     return;
                                 }
@@ -1615,14 +1704,14 @@ private:
                             if (command::TrashFastCommand::is_enabled()) {
                                 std::string item_id, count;
                                 std::smatch m;
-                                if (std::regex_search(dialog_content, m, std::regex("embed_data\\|itemID\\|([0-9]+)")))
+                                if (std::regex_search(dialog_content, m, kItemIdRe))
                                     item_id = m[1].str();
                                 
-                                if (std::regex_search(dialog_content, m, std::regex("add_text_input\\|count\\|\\|([0-9]*)")))
+                                if (std::regex_search(dialog_content, m, kCountRe))
                                     count = m[1].str();
                                 
                                 if (count.empty() || count == "0") {
-                                    if (std::regex_search(dialog_content, m, std::regex("you have ([0-9]+)")))
+                                    if (std::regex_search(dialog_content, m, kHaveRe))
                                         count = m[1].str();
                                 }
                                 if (count.empty() || count == "0") count = "1";
@@ -1635,16 +1724,9 @@ private:
                                         resp = "action|dialog_return\ndialog_name|trash_item\nitemID|" + item_id + "|\nbuttonClicked|yes";
                                         spdlog::info("TrashFast: auto-confirmed warning dialog itemID={}", item_id);
                                     }
-                                    core::Core* core = core_;
-                                    std::thread([core, resp]() {
-                                        std::this_thread::sleep_for(std::chrono::milliseconds(150));
-                                        if (core && core->get_client() && core->get_client()->get_player()) {
-                                            ByteStream<std::uint16_t> bs{};
-                                            bs.write(packet::NET_MESSAGE_GENERIC_TEXT);
-                                            bs.write(resp, false);
-                                            core->get_client()->get_player()->send_packet(bs.get_data(), 0);
-                                        }
-                                    }).detach();
+                                    // X11: was a detached thread (check-then-send race on the player object).
+                                    // Tick-deferred now - same 150ms, no thread.
+                                    defer_upstream_text(resp, 150);
                                     const_cast<core::EventPacket&>(event).canceled = true;
                                     return;
                                 }
@@ -1656,14 +1738,14 @@ private:
                             dialog_content.find("end_dialog|popup|") != std::string::npos) {
                             std::smatch netid_match;
                             std::string target_netid = "0";
-                            const std::regex netid_re("embed_data\\|(?:netID|netid)\\|([0-9]+)");
+                            static const std::regex netid_re("embed_data\\|(?:netID|netid)\\|([0-9]+)");
                             if (std::regex_search(dialog_content, netid_match, netid_re) && netid_match.size() > 1) {
                                 target_netid = netid_match[1].str();
                             }
 
                             std::string player_name;
                             std::smatch name_match;
-                            const std::regex name_re("add_label_with_icon\\|big\\|`w([^`\\|\\(]+)");
+                            static const std::regex name_re("add_label_with_icon\\|big\\|`w([^`\\|\\(]+)");
                             if (std::regex_search(dialog_content, name_match, name_re) && name_match.size() > 1) {
                                 player_name = name_match[1].str();
                             }
@@ -1679,20 +1761,9 @@ private:
                                 if (wrench_auto_ban) cmd = "/ban " + player_name + " ";
                                 else if (wrench_auto_kick) cmd = "/kick " + player_name + " ";
 
-                                core::Core* core = core_;
-                                std::thread([core, cmd]() {
-                                    std::this_thread::sleep_for(std::chrono::milliseconds(70));
-                                    for (int i = 0; i < 3; ++i) {
-                                        if (!core || !core->get_client() || !core->get_client()->get_player()) {
-                                            break;
-                                        }
-                                        ByteStream<std::uint16_t> bs{};
-                                        bs.write(packet::NET_MESSAGE_GENERIC_TEXT);
-                                        bs.write("action|input\ntext|" + cmd, false);
-                                        core->get_client()->get_player()->send_packet(bs.get_data(), 0);
-                                        std::this_thread::sleep_for(std::chrono::milliseconds(90));
-                                    }
-                                }).detach();
+                                // X11: was a detached thread; Tick-deferred now (70ms, then 3 sends
+                                // 90ms apart - same timing, no thread).
+                                defer_upstream_text("action|input\ntext|" + cmd, 70, 3, 90);
 
                                 spdlog::info("AutoWrench: target_netid={}, name='{}', cmd='{}'", target_netid, player_name, cmd);
                                 const_cast<core::EventPacket&>(event).canceled = true;

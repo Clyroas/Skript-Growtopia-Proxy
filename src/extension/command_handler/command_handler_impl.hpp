@@ -23,6 +23,7 @@
 #include "gsbeta_command.hpp"
 #include "inventory_command.hpp"
 #include "dropall_command.hpp"
+#include "pickup_command.hpp"
 #include "autocomp_command.hpp"
 #include "autocollect_command.hpp"
 #include "dropfast_command.hpp"
@@ -132,8 +133,10 @@ public:
         command::BackCommand::set_core(core_);
         command::DropAtCommand::set_core(core_);
         command::FindPathCommand::set_core(core_);
+        command::ScanPathCommand::set_core(core_);
         command::RunCommand::set_core(core_);
         command::PlayerTPCommand::set_core(core_);
+        command::TeleportCommand::set_core(core_);
         command::FlagCommand::set_core(core_);
         command::InvisCommand::set_core(core_);
 
@@ -180,6 +183,11 @@ public:
         command::SkinCommand::set_core(core_);
         command::DeathAnimCommand::set_core(core_);
         command::RespawnAnimCommand::set_core(core_);
+        command::QuickRespawnCommand::set_core(core_);
+        command::RandomWorldCommand::set_core(core_);
+        command::SpinAllCommand::set_core(core_);
+        command::FastWheelCommand::set_core(core_);
+        command::PickupCommand::set_core(core_);
         command::ParticleCommand::set_core(core_);
         command::ItemEffectCommand::set_core(core_);
         command::BannerCommand::set_core(core_);
@@ -217,6 +225,7 @@ public:
         register_command(std::make_unique<command::GsBetaCommand>());
         register_command(std::make_unique<command::InventoryCommand>());
         register_command(std::make_unique<command::DropAllCommand>());
+        register_command(std::make_unique<command::PickupCommand>());
         register_command(std::make_unique<command::AutoCompCommand>());
         register_command(std::make_unique<command::AutoCollectCommand>());
         register_command(std::make_unique<command::DropFastCommand>());
@@ -244,7 +253,9 @@ public:
         register_command(std::make_unique<command::BackCommand>());
         register_command(std::make_unique<command::DropAtCommand>());
         register_command(std::make_unique<command::FindPathCommand>());
+        register_command(std::make_unique<command::ScanPathCommand>());
         register_command(std::make_unique<command::PlayerTPCommand>());
+        register_command(std::make_unique<command::TeleportCommand>());
         register_command(std::make_unique<command::FlagCommand>());
         register_command(std::make_unique<command::InvisCommand>());
         register_command(std::make_unique<command::SmCommand>());
@@ -302,6 +313,10 @@ public:
         register_command(std::make_unique<command::SkinCommand>());
         register_command(std::make_unique<command::DeathAnimCommand>());
         register_command(std::make_unique<command::RespawnAnimCommand>());
+        register_command(std::make_unique<command::QuickRespawnCommand>());
+        register_command(std::make_unique<command::RandomWorldCommand>());
+        register_command(std::make_unique<command::SpinAllCommand>());
+        register_command(std::make_unique<command::FastWheelCommand>());
         register_command(std::make_unique<command::ParticleCommand>());
         register_command(std::make_unique<command::ItemEffectCommand>());
         register_command(std::make_unique<command::BannerCommand>());
@@ -734,12 +749,12 @@ private:
             for (size_t i = 0; i < command_source.length() && i < 50; ++i) {
                 raw_bytes += fmt::format("[{}:0x{:02X}] ", command_source[i], (unsigned char)command_source[i]);
             }
-            spdlog::info("[CHAT] Raw bytes: {}", raw_bytes);
+            spdlog::debug("[CHAT] Raw bytes: {}", raw_bytes);
             
             std::string command_text = trim(command_source.substr(1));  
             
-            spdlog::info("[CHAT] Raw command from client: '{}' (len={})", command_source, command_source.length());
-            spdlog::info("[CHAT] After substr(1) and trim: '{}' (len={})", command_text, command_text.length());
+            spdlog::debug("[CHAT] Raw command from client: '{}' (len={})", command_source, command_source.length());
+            spdlog::debug("[CHAT] After substr(1) and trim: '{}' (len={})", command_text, command_text.length());
             
             if (command_text == "gui" || command_text == "menu" || command_text == "interface") {
                 send_gui_to_player(const_cast<player::Player*>(&event.get_player()), "main");
@@ -794,25 +809,28 @@ private:
         const auto& game_packet = event.get_packet();
         const auto& ext_data = event.get_ext_data();
 
+        // X8: this whole handler is client-side (tile clicks, GUI dialog returns).
+        // A server-sent packet must never drive proxy GUI commands.
+        if (event.from != core::EventFrom::FromClient) {
+            return;
+        }
+
         
         if (game_packet.type == packet::PACKET_TILE_CHANGE_REQUEST ||
             game_packet.type == packet::PACKET_TILE_ACTIVATE_REQUEST) {
-            const packet::TankUpdatePacket* tank = nullptr;
-            if (ext_data.size() >= sizeof(packet::TankUpdatePacket)) {
-                tank = reinterpret_cast<const packet::TankUpdatePacket*>(ext_data.data());
-            } else {
-                tank = reinterpret_cast<const packet::TankUpdatePacket*>(&game_packet);
-            }
+            // X13: the tank is header-inline (same evidence as X1/X2). The old
+            // ext-first hedge read garbage coords whenever ext was >= 56 bytes.
+            const auto* tank = reinterpret_cast<const packet::TankUpdatePacket*>(&game_packet);
             client::Client* client = core_->get_client();
+            if (client && command::TeleportCommand::handle_autopath_click(client, tank->int_x, tank->int_y)) {
+                const_cast<core::EventPacket&>(event).canceled = true;
+                return;
+            }
             if (client && command::FindPathCommand::handle_shift_click(client, tank->int_x, tank->int_y)) {
                 const_cast<core::EventPacket&>(event).canceled = true;
                 return;
             }
             
-        }
-
-        if (event.from != core::EventFrom::FromClient) {
-            return;
         }
 
         if (game_packet.type != packet::PACKET_CALL_FUNCTION) {
@@ -829,7 +847,8 @@ private:
                 return;
             }
 
-            if (variant.size() >= 2 && variant.get<std::string>(0) == "OnDialogReturn") {
+            // X8: was size() >= 2 while index 2 is read below.
+            if (variant.size() >= 3 && variant.get<std::string>(0) == "OnDialogReturn") {
                 std::string dialog_name = variant.get<std::string>(1);
                 std::string dialog_data = variant.get<std::string>(2);
                 TextParse text_parse{dialog_data};
@@ -839,8 +858,21 @@ private:
                 
                 spdlog::info("[DIALOG] Received dialog return - name: '{}', button_clicked: '{}', data_size: {}", 
                            dialog_name, button_clicked, dialog_data.size());
-                spdlog::info("[DIALOG] Raw dialog data: '{}'", dialog_data);
+                spdlog::debug("[DIALOG] Raw dialog data: '{}'", dialog_data);
                 
+                // X8: only swallow dialogs the proxy actually handles. The old code
+                // canceled every OnDialogReturn, including game flows the proxy
+                // knows nothing about. Keep in sync with the chain below.
+                static constexpr const char* kHandledDialogs[] = {
+                    "skript_gui", "proxy_gui", "info_gui", "name_change", "title_gui",
+                    "host_settings", "wrench_settings", "drop_gui",
+                    "growscan_menu", "growscan_results"
+                };
+                bool dialog_handled = false;
+                for (const char* name : kHandledDialogs) {
+                    if (dialog_name == name) { dialog_handled = true; break; }
+                }
+
                 if (dialog_name == "skript_gui") {
                     handle_main_gui_response(const_cast<player::Player*>(&event.get_player()), button_clicked, world_name);
                 }
@@ -868,9 +900,14 @@ private:
                 else if (dialog_name == "growscan_menu" || dialog_name == "growscan_results") {
                     handle_growscan_response(const_cast<player::Player*>(&event.get_player()), button_clicked, dialog_name);
                 }
-                
-                
-                event.canceled = true;
+
+                // X8: unhandled dialog names fall through so the game can
+                // process them normally.
+                if (dialog_handled) {
+                    event.canceled = true;
+                } else {
+                    spdlog::debug("[DIALOG] Unhandled dialog return '{}' - passing through", dialog_name);
+                }
             }
         } catch (const std::exception& e) {
             spdlog::warn("Error handling dialog response: {}", e.what());

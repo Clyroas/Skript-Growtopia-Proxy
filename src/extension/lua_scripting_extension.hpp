@@ -13,6 +13,7 @@
 #include "../utils/text_parse.hpp"
 #include "../extension/command_handler/autocollect_command.hpp"
 #include "../extension/command_handler/utility_commands.hpp"
+#include "../extension/item_finder/item_finder.hpp"
 #include "../proxy_imgui_gui.hpp"
 #include <filesystem>
 #include <fstream>
@@ -20,6 +21,7 @@
 #include <mutex>
 #include <functional>
 #include <algorithm>
+#include <atomic>
 #include <spdlog/spdlog.h>
 
 namespace extension::lua_scripting {
@@ -27,10 +29,16 @@ namespace extension::lua_scripting {
 struct LuaCallbackEntry { std::string name, event; int ref = LUA_NOREF; };
 inline std::mutex g_cb_mutex;
 inline std::vector<LuaCallbackEntry> g_callbacks;
+inline std::atomic<bool> g_lua_stopping{false};
+inline std::mutex g_lua_threads_mutex;
+inline std::vector<std::thread> g_lua_threads;
 
 static void lua_invoke_callbacks(lua_State* L, const std::string& event,
     std::function<int()> push_args, bool* canceled = nullptr)
 {
+    auto* bridge = lua::LuaManager::get();
+    if (!bridge || bridge->get_state() != L || g_lua_stopping.load()) return;
+    std::lock_guard<std::recursive_mutex> state_lock(bridge->state_mutex());
     std::vector<LuaCallbackEntry> cbs;
     { std::lock_guard<std::mutex> lk(g_cb_mutex);
       for (auto& e : g_callbacks) if (e.event == event) cbs.push_back(e); }
@@ -51,18 +59,47 @@ static void lua_invoke_callbacks(lua_State* L, const std::string& event,
 class LuaScriptingExtension final : public IExtension {
     core::Core* core_;
     bool hooked_ = false;
+    std::shared_ptr<std::atomic<bool>> active_ = std::make_shared<std::atomic<bool>>(true);
+    std::shared_ptr<std::recursive_mutex> listener_gate_ = std::make_shared<std::recursive_mutex>();
+    std::vector<std::pair<core::EventType, core::EventDispatcher::Handle>> listener_handles_;
 public:
     PROVIDE_EXT_UID(0x4C554153);
     explicit LuaScriptingExtension(core::Core* c) : core_{c} {}
     ~LuaScriptingExtension() override = default;
 
     void init() override {
+        g_lua_stopping.store(false);
         lua::LuaManager::initialize();
         register_globals();
         hook_events();
         load_scripts();
     }
-    void free() override { lua::LuaManager::shutdown(); delete this; }
+    void free() override {
+        active_->store(false);
+        { std::lock_guard<std::recursive_mutex> callback_barrier(*listener_gate_); }
+        for (const auto& [event, handle] : listener_handles_)
+            core_->get_event_dispatcher().removeListener(event, handle);
+        listener_handles_.clear();
+
+        g_lua_stopping.store(true);
+        std::vector<std::thread> workers;
+        { std::lock_guard<std::mutex> lock(g_lua_threads_mutex); workers.swap(g_lua_threads); }
+        for (auto& worker : workers) if (worker.joinable()) worker.join();
+
+        if (auto* bridge = lua::LuaManager::get()) {
+            {
+                std::lock_guard<std::recursive_mutex> state_lock(bridge->state_mutex());
+                auto* L = bridge->get_state();
+                std::lock_guard<std::mutex> lock(g_cb_mutex);
+                for (const auto& callback : g_callbacks)
+                    if (callback.ref != LUA_NOREF && callback.ref != LUA_REFNIL)
+                        luaL_unref(L, LUA_REGISTRYINDEX, callback.ref);
+                g_callbacks.clear();
+            }
+            lua::LuaManager::shutdown();
+        }
+        delete this;
+    }
 
 private:
     static void push_gup(lua_State* L, const packet::GameUpdatePacket& p) {
@@ -92,8 +129,12 @@ private:
     void hook_events() {
         if (hooked_) return; hooked_ = true;
         
-        core_->get_event_dispatcher().appendListener(core::EventType::Packet,
-            [this](const core::EventPacket& ev) {
+        auto active = active_;
+        auto gate = listener_gate_;
+        listener_handles_.push_back({core::EventType::Packet, core_->get_event_dispatcher().appendListener(core::EventType::Packet,
+            [active, gate](const core::EventPacket& ev) {
+                std::lock_guard<std::recursive_mutex> callback_lock(*gate);
+                if (!active->load() || g_lua_stopping.load()) return;
                 if (ev.from != core::EventFrom::FromServer) return;
                 if (ev.get_packet().type != packet::PACKET_CALL_FUNCTION) return;
                 auto* L = lua::LuaManager::get()->get_state();
@@ -114,22 +155,27 @@ private:
                     return 2;
                 }, &canceled);
                 if (canceled) const_cast<core::EventPacket&>(ev).canceled = true;
-            });
+            })});
         
-        core_->get_event_dispatcher().appendListener(core::EventType::Message,
-            [this](const core::EventMessage& ev) {
+        listener_handles_.push_back({core::EventType::Message, core_->get_event_dispatcher().appendListener(core::EventType::Message,
+            [active, gate](const core::EventMessage& ev) {
+                std::lock_guard<std::recursive_mutex> callback_lock(*gate);
+                if (!active->load() || g_lua_stopping.load()) return;
                 if (ev.from != core::EventFrom::FromClient) return;
                 auto* L = lua::LuaManager::get()->get_state();
                 std::string raw = ev.get_message().get_raw();
                 bool canceled = false;
                 lua_invoke_callbacks(L, "OnPacket", [&]() -> int {
-                    lua_pushinteger(L, 2); lua_pushstring(L, raw.c_str()); return 2;
+                    // X19: lua_pushlstring - raw message bytes may contain NULs, which lua_pushstring would truncate at.
+                    lua_pushinteger(L, 2); lua_pushlstring(L, raw.data(), raw.size()); return 2;
                 }, &canceled);
                 if (canceled) const_cast<core::EventMessage&>(ev).canceled = true;
-            });
+            })});
         
-        core_->get_event_dispatcher().appendListener(core::EventType::Packet,
-            [this](const core::EventPacket& ev) {
+        listener_handles_.push_back({core::EventType::Packet, core_->get_event_dispatcher().appendListener(core::EventType::Packet,
+            [active, gate](const core::EventPacket& ev) {
+                std::lock_guard<std::recursive_mutex> callback_lock(*gate);
+                if (!active->load() || g_lua_stopping.load()) return;
                 if (ev.from != core::EventFrom::FromClient) return;
                 auto* L = lua::LuaManager::get()->get_state();
                 bool canceled = false;
@@ -137,10 +183,12 @@ private:
                     push_gup(L, ev.get_packet()); return 1;
                 }, &canceled);
                 if (canceled) const_cast<core::EventPacket&>(ev).canceled = true;
-            });
+            })});
         
-        core_->get_event_dispatcher().appendListener(core::EventType::Packet,
-            [this](const core::EventPacket& ev) {
+        listener_handles_.push_back({core::EventType::Packet, core_->get_event_dispatcher().appendListener(core::EventType::Packet,
+            [active, gate](const core::EventPacket& ev) {
+                std::lock_guard<std::recursive_mutex> callback_lock(*gate);
+                if (!active->load() || g_lua_stopping.load()) return;
                 if (ev.from != core::EventFrom::FromServer) return;
                 if (ev.get_packet().type == packet::PACKET_CALL_FUNCTION) return;
                 auto* L = lua::LuaManager::get()->get_state();
@@ -149,7 +197,7 @@ private:
                     push_gup(L, ev.get_packet()); return 1;
                 }, &canceled);
                 if (canceled) const_cast<core::EventPacket&>(ev).canceled = true;
-            });
+            })});
     }
 
     
@@ -171,24 +219,39 @@ private:
 
         
         lua_pushcclosure(L, [](lua_State* ls) -> int {
-            std::this_thread::sleep_for(std::chrono::milliseconds((int)luaL_checkinteger(ls, 1)));
+            const int duration_ms = (int)luaL_checkinteger(ls, 1);
+            const auto deadline = std::chrono::steady_clock::now()
+                + std::chrono::milliseconds(std::max(0, duration_ms));
+            while (!g_lua_stopping.load() && std::chrono::steady_clock::now() < deadline)
+                std::this_thread::sleep_for(std::chrono::milliseconds(25));
             return 0;
         }, 0);
         lua_setglobal(L, "Sleep");
+        lua_getglobal(L, "Sleep"); lua_setglobal(L, "SleepMS");
 
         
         lua_pushcclosure(L, [](lua_State* ls) -> int {
             luaL_checktype(ls, 1, LUA_TFUNCTION);
             lua_pushvalue(ls, 1);
             int ref = luaL_ref(ls, LUA_REGISTRYINDEX);
-            std::thread([ls, ref]() {
-                lua_rawgeti(ls, LUA_REGISTRYINDEX, ref);
-                if (lua_pcall(ls, 0, 0, 0) != LUA_OK) {
-                    AppendLog("[LUA] Thread error: " + std::string(lua_tostring(ls, -1)));
-                    lua_pop(ls, 1);
+            std::lock_guard<std::mutex> lock(g_lua_threads_mutex);
+            if (g_lua_stopping.load()) {
+                luaL_unref(ls, LUA_REGISTRYINDEX, ref);
+                return 0;
+            }
+            g_lua_threads.emplace_back([ls, ref]() {
+                auto* bridge = lua::LuaManager::get();
+                if (!bridge || bridge->get_state() != ls) return;
+                std::lock_guard<std::recursive_mutex> state_lock(bridge->state_mutex());
+                if (!g_lua_stopping.load()) {
+                    lua_rawgeti(ls, LUA_REGISTRYINDEX, ref);
+                    if (lua_pcall(ls, 0, 0, 0) != LUA_OK) {
+                        AppendLog("[LUA] Thread error: " + std::string(lua_tostring(ls, -1)));
+                        lua_pop(ls, 1);
+                    }
                 }
                 luaL_unref(ls, LUA_REGISTRYINDEX, ref);
-            }).detach();
+            });
             return 0;
         }, 0);
         lua_setglobal(L, "RunThread");
@@ -290,6 +353,7 @@ private:
             return 0;
         }, 1);
         lua_setglobal(L, "SendVarlist");
+        lua_getglobal(L, "SendVarlist"); lua_setglobal(L, "SendVariant");
 
         
         lua_pushlightuserdata(L, core_);
@@ -395,6 +459,25 @@ private:
             return 1;
         }, 0);
         lua_setglobal(L, "GetPlayers");
+        lua_getglobal(L, "GetPlayers"); lua_setglobal(L, "GetPlayerList");
+
+        lua_pushcclosure(L, [](lua_State* ls) -> int {
+            const auto net_id = static_cast<uint32_t>(luaL_checkinteger(ls, 1));
+            auto player = utils::PlayerTracker::get_instance().get_player_by_netid(net_id);
+            if (player.name.empty()) { lua_pushnil(ls); return 1; }
+            lua_createtable(ls, 0, 9);
+            lua_pushstring(ls, player.name.c_str()); lua_setfield(ls, -2, "name");
+            lua_pushstring(ls, player.country.c_str()); lua_setfield(ls, -2, "country");
+            lua_pushinteger(ls, player.netID); lua_setfield(ls, -2, "netid");
+            lua_pushinteger(ls, player.userID); lua_setfield(ls, -2, "userid");
+            lua_pushnumber(ls, player.position.x); lua_setfield(ls, -2, "pos_x");
+            lua_pushnumber(ls, player.position.y); lua_setfield(ls, -2, "pos_y");
+            lua_pushinteger(ls, static_cast<int>(player.position.x / 32.0f)); lua_setfield(ls, -2, "tile_x");
+            lua_pushinteger(ls, static_cast<int>(player.position.y / 32.0f)); lua_setfield(ls, -2, "tile_y");
+            lua_pushboolean(ls, player.is_local); lua_setfield(ls, -2, "is_local");
+            return 1;
+        }, 0);
+        lua_setglobal(L, "GetPlayerByNetID");
 
         
         lua_pushcclosure(L, [](lua_State* ls) -> int {
@@ -463,6 +546,7 @@ private:
             return 1;
         }, 0);
         lua_setglobal(L, "GetTile");
+        lua_getglobal(L, "GetTile"); lua_setglobal(L, "CheckTile");
 
         
         lua_pushcclosure(L, [](lua_State* ls) -> int {
@@ -565,33 +649,57 @@ private:
         
         lua_pushcclosure(L, [](lua_State* ls) -> int {
             const char* name = luaL_checkstring(ls, 1);
+            auto* bridge = lua::LuaManager::get();
+            if (!bridge) return 0;
+            std::lock_guard<std::recursive_mutex> state_lock(bridge->state_mutex());
             std::lock_guard<std::mutex> lk(g_cb_mutex);
-            g_callbacks.erase(std::remove_if(g_callbacks.begin(), g_callbacks.end(),
-                [name](const LuaCallbackEntry& e) { return e.name == name; }),
-                g_callbacks.end());
+            auto it = g_callbacks.begin();
+            while (it != g_callbacks.end()) {
+                if (it->name == name) {
+                    if (it->ref != LUA_NOREF && it->ref != LUA_REFNIL)
+                        luaL_unref(ls, LUA_REGISTRYINDEX, it->ref);
+                    it = g_callbacks.erase(it);
+                } else ++it;
+            }
             return 0;
         }, 0);
         lua_setglobal(L, "RemoveCallback");
 
         
         lua_pushcclosure(L, [](lua_State* ls) -> int {
+            auto* bridge = lua::LuaManager::get();
+            if (!bridge) return 0;
+            std::lock_guard<std::recursive_mutex> state_lock(bridge->state_mutex());
             std::lock_guard<std::mutex> lk(g_cb_mutex);
+            for (const auto& callback : g_callbacks)
+                if (callback.ref != LUA_NOREF && callback.ref != LUA_REFNIL)
+                    luaL_unref(ls, LUA_REGISTRYINDEX, callback.ref);
             g_callbacks.clear(); return 0;
         }, 0);
         lua_setglobal(L, "RemoveCallbacks");
 
         
         lua_pushcclosure(L, [](lua_State* ls) -> int {
-            int id = (int)luaL_checkinteger(ls, 1);
-            lua_createtable(ls, 0, 5);
-            lua_pushstring(ls, ("item_" + std::to_string(id)).c_str()); lua_setfield(ls, -2, "name");
-            lua_pushinteger(ls, 0); lua_setfield(ls, -2, "item_type");
-            lua_pushinteger(ls, 0); lua_setfield(ls, -2, "rarity");
-            lua_pushinteger(ls, 0); lua_setfield(ls, -2, "growth");
-            lua_pushinteger(ls, 0); lua_setfield(ls, -2, "size");
+            const int id = static_cast<int>(luaL_checkinteger(ls, 1));
+            auto* database = extension::item_finder::ItemDatabase::get_instance();
+            const auto* item = database ? database->get_item_by_id(id) : nullptr;
+            if (!item) { lua_pushnil(ls); return 1; }
+            lua_createtable(ls, 0, 9);
+            lua_pushinteger(ls, item->id); lua_setfield(ls, -2, "id");
+            lua_pushstring(ls, item->name.c_str()); lua_setfield(ls, -2, "name");
+            lua_pushinteger(ls, item->type); lua_setfield(ls, -2, "type");
+            lua_pushinteger(ls, item->type); lua_setfield(ls, -2, "item_type");
+            lua_pushinteger(ls, item->rarity); lua_setfield(ls, -2, "rarity");
+            lua_pushstring(ls, item->file_name.c_str()); lua_setfield(ls, -2, "file_name");
+            lua_pushinteger(ls, item->clothing_type); lua_setfield(ls, -2, "clothing_type");
+            lua_pushinteger(ls, item->properties); lua_setfield(ls, -2, "properties");
+            lua_pushstring(ls, item->description.c_str()); lua_setfield(ls, -2, "description");
+            lua_pushstring(ls, item->info.c_str()); lua_setfield(ls, -2, "info");
             return 1;
         }, 0);
         lua_setglobal(L, "GetIteminfo");
+        lua_getglobal(L, "GetIteminfo"); lua_setglobal(L, "GetItemInfo");
+        lua_getglobal(L, "GetIteminfo"); lua_setglobal(L, "GetItemByID");
 
         
         lua_pushcclosure(L, [](lua_State* ls) -> int {
@@ -644,6 +752,9 @@ private:
     }
 
     void load_scripts() {
+        auto* bridge = lua::LuaManager::get();
+        if (!bridge) return;
+        std::lock_guard<std::recursive_mutex> state_lock(bridge->state_mutex());
         std::filesystem::path dir = "scripts";
         if (!std::filesystem::exists(dir))
             std::filesystem::create_directory(dir);

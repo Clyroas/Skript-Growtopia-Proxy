@@ -9,6 +9,7 @@
 #include "../../utils/player_tracker.hpp"  
 #include <spdlog/spdlog.h>
 #include <chrono>
+#include <cstring>
 
 namespace extension::player_state_tracker {
 
@@ -34,14 +35,20 @@ public:
     ~PlayerStateTrackerExtension() override = default;
 
     void init() override {
-        spdlog::trace("`2[PlayerStateTracker]`` Initializing");
+        spdlog::trace("[PlayerStateTracker] Initializing");
         
         
-        core_->get_config().set("features.double_jump", true);
-        core_->get_config().set("features.immune_damage", false);
+        // X9: seed defaults only when the keys are absent. Unconditionally overwriting
+        // them here wiped the user's config.json choice on every boot.
+        if (!core_->get_config().contains("features.double_jump")) {
+            core_->get_config().set("features.double_jump", true);
+        }
+        if (!core_->get_config().contains("features.immune_damage")) {
+            core_->get_config().set("features.immune_damage", false);
+        }
         
-        spdlog::trace("`2[PlayerStateTracker]`` Double jump `2ENABLED`` by default");
-        spdlog::trace("`o[PlayerStateTracker]`` Damage immunity `4DISABLED`` - use /immune to enable");
+        spdlog::trace("[PlayerStateTracker] Double jump ENABLED by default");
+        spdlog::trace("[PlayerStateTracker] Damage immunity DISABLED - use /immune to enable");
 
         
         core_->get_event_dispatcher().prependListener(
@@ -51,7 +58,7 @@ public:
             }
         );
         
-        spdlog::trace("`2[PlayerStateTracker]`` System ready");
+        spdlog::trace("[PlayerStateTracker] System ready");
     }
 
 private:
@@ -74,12 +81,18 @@ private:
                         if (text_parse.get("type") == "local") {
                             local_netid_ = text_parse.get<int32_t>("netID");
                             is_spawned_ = true;
-                            core_->get_config().set<int>("player.netid", local_netid_);
+                            core_->get_config().set_runtime<int>("player.netid", local_netid_);
                             spdlog::info("[PlayerStateTracker] OnSpawn - Local NetID: {} detected and saved.", local_netid_);
                         }
                     }
                 }
-            } catch (...) {}
+            } catch (const std::exception& e) {
+                // X9: was catch(...) {} - a parse failure left local_netid_ == -1
+                // and silently disabled immunity/position features.
+                spdlog::warn("[PlayerStateTracker] OnSpawn parse failed: {}", e.what());
+            } catch (...) {
+                spdlog::warn("[PlayerStateTracker] OnSpawn parse failed (unknown error)");
+            }
         }
         
         
@@ -93,10 +106,10 @@ private:
         
         
         if (event.from == core::EventFrom::FromClient) {
-            spdlog::info("\033[36m[STATE-CLIENT]\033[0m NetID: {} | vec_x: {:.1f}, vec_y: {:.1f} | flags: 0x{:X}", 
+            spdlog::trace("[STATE-CLIENT] NetID: {} | vec_x: {:.1f}, vec_y: {:.1f} | flags: 0x{:X}", 
                        tank->net_id, tank->vec_x, tank->vec_y, tank->flags);
         } else {
-            spdlog::info("\033[35m[STATE-SERVER]\033[0m NetID: {} | vec_x: {:.1f}, vec_y: {:.1f} | flags: 0x{:X}", 
+            spdlog::trace("[STATE-SERVER] NetID: {} | vec_x: {:.1f}, vec_y: {:.1f} | flags: 0x{:X}", 
                        tank->net_id, tank->vec_x, tank->vec_y, tank->flags);
         }
         
@@ -111,10 +124,12 @@ private:
                 local_y_ = tank->vec_y;
                 
                 
-                core_->get_config().set<std::string>("player.position.x", std::to_string(tank->vec_x));
-                core_->get_config().set<std::string>("player.position.y", std::to_string(tank->vec_y));
+                // This is live session state. Persisting every movement packet would
+                // rewrite config.json dozens of times per second.
+                core_->get_config().set_runtime<std::string>("player.position.x", std::to_string(tank->vec_x));
+                core_->get_config().set_runtime<std::string>("player.position.y", std::to_string(tank->vec_y));
                 
-                spdlog::info("\033[36m[CLIENT POS]\033[0m NetID: {} | Tile ({}, {}) | Pixels ({:.1f}, {:.1f})", 
+                spdlog::trace("[CLIENT POS] NetID: {} | Tile ({}, {}) | Pixels ({:.1f}, {:.1f})", 
                            tank->net_id, tile_x, tile_y, tank->vec_x, tank->vec_y);
                 handle_client_actions(event, tank);
             }
@@ -124,7 +139,7 @@ private:
                 bool is_local_player = (local_netid_ > 0 && tank->net_id == local_netid_);
                 std::string player_type = is_local_player ? "[LOCAL]" : "[OTHER]";
                 
-                spdlog::info("\033[34m[SERVER POS]\033[0m {} NetID: {} | Tile ({}, {}) | Pixels ({:.1f}, {:.1f})", 
+                spdlog::trace("[SERVER POS] {} NetID: {} | Tile ({}, {}) | Pixels ({:.1f}, {:.1f})", 
                            player_type, tank->net_id, tile_x, tile_y, tank->vec_x, tank->vec_y);
                 
                 utils::PlayerTracker::get_instance().update_player_position(
@@ -137,8 +152,8 @@ private:
                     local_y_ = tank->vec_y;
                     
                     
-                    core_->get_config().set<std::string>("player.position.x", std::to_string(tank->vec_x));
-                    core_->get_config().set<std::string>("player.position.y", std::to_string(tank->vec_y));
+                    core_->get_config().set_runtime<std::string>("player.position.x", std::to_string(tank->vec_x));
+                    core_->get_config().set_runtime<std::string>("player.position.y", std::to_string(tank->vec_y));
                     
                     handle_server_updates(event, tank);
                 }
@@ -151,13 +166,13 @@ private:
         packet::TankUpdatePacket modified_tank = *tank;
         
         
-        spdlog::debug("[CLIENT STATE] Processing - flags: 0x{:X}", tank->flags);
+        spdlog::trace("[CLIENT STATE] Processing - flags: 0x{:X}", tank->flags);
         
         
         if (tank->vec_x > 0 && tank->vec_y > 0) {
             int tile_x = static_cast<int>(tank->vec_x / 32.0f);
             int tile_y = static_cast<int>(tank->vec_y / 32.0f);
-            spdlog::debug("[CLIENT POS] Tile ({}, {}) | Pixels ({:.0f}, {:.0f})", 
+            spdlog::trace("[CLIENT POS] Tile ({}, {}) | Pixels ({:.0f}, {:.0f})", 
                         tile_x, tile_y, tank->vec_x, tank->vec_y);
         }
         
@@ -165,7 +180,7 @@ private:
         bool jumping = (tank->flags & packet::PACKET_FLAG_ON_JUMP) != 0;
         bool on_solid = (tank->flags & packet::PACKET_FLAG_ON_SOLID) != 0;
         
-        spdlog::info("\033[33m[FLAG CHECK]\033[0m jumping={}, on_solid={}", jumping, on_solid);
+        spdlog::trace("[FLAG CHECK] jumping={}, on_solid={}", jumping, on_solid);
         
         
         if (core_->get_config().get<bool>("features.double_jump")) {
@@ -173,13 +188,13 @@ private:
                 
                 if (!on_solid) {
                     consecutive_jumps_++;
-                    spdlog::info("\033[32m[DOUBLE JUMP]\033[0m Mid-air jump #{} at tile ({}, {})", 
+                    spdlog::info("[DOUBLE JUMP] Mid-air jump #{} at tile ({}, {})", 
                                consecutive_jumps_, 
                                static_cast<int>(tank->vec_x / 32.0f),
                                static_cast<int>(tank->vec_y / 32.0f));
                 } else {
                     consecutive_jumps_ = 1;
-                    spdlog::debug("[JUMP] Ground jump at tile ({}, {})", 
+                    spdlog::trace("[JUMP] Ground jump at tile ({}, {})", 
                                 static_cast<int>(tank->vec_x / 32.0f),
                                 static_cast<int>(tank->vec_y / 32.0f));
                 }
@@ -188,12 +203,12 @@ private:
                 modified_tank.flags |= packet::PACKET_FLAG_ON_SOLID;
                 needs_modification = true;
                 
-                spdlog::info("\033[32m[DOUBLE JUMP]\033[0m Modified - Original: 0x{:X} -> New: 0x{:X}", 
+                spdlog::info("[DOUBLE JUMP] Modified - Original: 0x{:X} -> New: 0x{:X}", 
                            tank->flags, modified_tank.flags);
             } else {
                 
                 if (consecutive_jumps_ > 0) {
-                    spdlog::debug("[JUMP] Sequence ended ({} jumps total)", consecutive_jumps_);
+                    spdlog::trace("[JUMP] Sequence ended ({} jumps total)", consecutive_jumps_);
                     consecutive_jumps_ = 0;
                 }
             }
@@ -201,7 +216,7 @@ private:
         
         
         if (needs_modification) {
-            spdlog::info("\033[32m[SENDING MODIFIED PACKET]\033[0m For double jump");
+            spdlog::info("[SENDING MODIFIED PACKET] For double jump");
             send_modified_packet(event, modified_tank);
         }
     }
@@ -210,30 +225,30 @@ private:
         bool needs_modification = false;
         packet::TankUpdatePacket modified_tank = *tank;
         
-        spdlog::info("\033[33m[SERVER STATE]\033[0m Got packet for our netID: {} - flags: 0x{:X}", tank->net_id, tank->flags);
+        spdlog::trace("[SERVER STATE] Got packet for our netID: {} - flags: 0x{:X}", tank->net_id, tank->flags);
         
         
         bool is_our_player = (local_netid_ > 0 && tank->net_id == local_netid_);
         
-        spdlog::info("\033[33m[NETID CHECK]\033[0m local_netid_={}, tank->net_id={}, is_our_player={}", 
+        spdlog::trace("[NETID CHECK] local_netid_={}, tank->net_id={}, is_our_player={}", 
                     local_netid_, tank->net_id, is_our_player);
         
         
         if (is_our_player && tank->vec_x > 0 && tank->vec_y > 0) {
             int tile_x = static_cast<int>(tank->vec_x / 32.0f);
             int tile_y = static_cast<int>(tank->vec_y / 32.0f);
-            spdlog::debug("[SERVER UPDATE] Position confirmed: tile ({}, {})", tile_x, tile_y);
+            spdlog::trace("[SERVER UPDATE] Position confirmed: tile ({}, {})", tile_x, tile_y);
         }
         
         
         bool fire_damage = (tank->flags & packet::PACKET_FLAG_ON_FIRE_DAMAGE) != 0;
         bool acid_damage = (tank->flags & packet::PACKET_FLAG_ON_ACID_DAMAGE) != 0;
         
-        spdlog::info("\033[33m[DAMAGE FLAGS]\033[0m fire={}, acid={}", fire_damage, acid_damage);
+        spdlog::trace("[DAMAGE FLAGS] fire={}, acid={}", fire_damage, acid_damage);
         
         
         if (is_our_player && (fire_damage || acid_damage)) {
-            spdlog::info("\033[31m[DAMAGE DETECTED]\033[0m Fire: {} | Acid: {} at tile ({}, {})", 
+            spdlog::info("[DAMAGE DETECTED] Fire: {} | Acid: {} at tile ({}, {})", 
                        fire_damage, acid_damage,
                        static_cast<int>(tank->vec_x / 32.0f),
                        static_cast<int>(tank->vec_y / 32.0f));
@@ -241,50 +256,57 @@ private:
         
         
         if (is_our_player && core_->get_config().get<bool>("features.immune_damage")) {
-            spdlog::info("\033[33m[IMMUNITY CHECK]\033[0m Immunity is ENABLED");
+            spdlog::trace("[IMMUNITY CHECK] Immunity is ENABLED");
             if (fire_damage) {
                 modified_tank.flags &= ~packet::PACKET_FLAG_ON_FIRE_DAMAGE;
                 needs_modification = true;
-                spdlog::info("\033[32m[IMMUNE]\033[0m Blocked FIRE damage!");
+                spdlog::info("[IMMUNE] Blocked FIRE damage!");
             }
             
             if (acid_damage) {
                 modified_tank.flags &= ~packet::PACKET_FLAG_ON_ACID_DAMAGE;
                 needs_modification = true;
-                spdlog::info("\033[32m[IMMUNE]\033[0m Blocked ACID damage!");
+                spdlog::info("[IMMUNE] Blocked ACID damage!");
             }
             
             if (needs_modification) {
-                spdlog::info("\033[32m[IMMUNE]\033[0m Modified packet - Original: 0x{:X} -> New: 0x{:X}", 
+                spdlog::info("[IMMUNE] Modified packet - Original: 0x{:X} -> New: 0x{:X}", 
                            tank->flags, modified_tank.flags);
             }
         }
         
         
         if (needs_modification) {
-            spdlog::info("\033[32m[SENDING MODIFIED PACKET]\033[0m For immunity");
+            spdlog::info("[SENDING MODIFIED PACKET] For immunity");
             send_modified_packet(event, modified_tank);
         }
     }
 
     void send_modified_packet(const core::EventPacket& event, const packet::TankUpdatePacket& modified_tank) {
+        // X1: for STATE packets the tank is carried HEADER-INLINE (bytes 4..60 - see
+        // the read path in handle_packet). The old code sent the UNMODIFIED header
+        // plus the modified tank appended as ext_data, which the receiver never
+        // reads for STATE - so double-jump and immunity silently did nothing.
+        // The modification must be written INTO the header instead.
+        static_assert(sizeof(packet::GameUpdatePacket) == sizeof(packet::TankUpdatePacket),
+                      "STATE header and tank views must stay the same size");
+        packet::GameUpdatePacket out_packet{};
+        std::memcpy(&out_packet, &modified_tank, sizeof(out_packet));
+
         ByteStream<std::uint16_t> byte_stream{};
         byte_stream.write(packet::NET_MESSAGE_GAME_PACKET);
-        
-        
-        auto game_packet = event.get_packet();
-        byte_stream.write(game_packet);
-        
-        
-        const std::byte* tank_bytes = reinterpret_cast<const std::byte*>(&modified_tank);
-        byte_stream.write_data(tank_bytes, sizeof(packet::TankUpdatePacket));
-        
-        
+        byte_stream.write(out_packet);
+        // STATE packets normally carry no ext_data, but preserve it if present so
+        // data_size stays consistent with the payload.
+        const auto& ext_data = event.get_ext_data();
+        if (!ext_data.empty()) {
+            byte_stream.write_data(ext_data.data(), ext_data.size());
+        }
+
         event.get_target().send_packet(byte_stream.get_data(), 0);
-        
-        
+
         const_cast<core::EventPacket&>(event).canceled = true;
-        
+
         spdlog::debug("[PlayerStateTracker] Sent modified packet, canceled original");
     }
 };

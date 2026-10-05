@@ -12,7 +12,13 @@
 #include "extension/command_handler/vendfast_command.hpp"
 #include "extension/command_handler/join_command.hpp"
 #include "extension/command_handler/moddetect_command.hpp"   
+#include "extension/command_handler/doorid_command.hpp"
 #include "extension/command_handler/autocollect_command.hpp"
+#include "extension/command_handler/utility_commands.hpp"
+#include "utils/packet_utils.hpp"
+#include "client/client.hpp"
+#include "server/server.hpp"
+#include <fmt/format.h>
 #include "utils/lua_manager.hpp"
 #include "utils/lua_bridge.hpp"
 #include "utils/world_manager.hpp"
@@ -35,6 +41,9 @@
 #include <sstream>
 #include <fstream> 
 #include <string_view>
+#include <cstring>
+#include <atomic>
+#include <thread>
 
 #pragma comment(lib, "d3d9.lib")
 
@@ -51,6 +60,9 @@ static LPDIRECT3D9           g_pD3D       = nullptr;
 static LPDIRECT3DDEVICE9     g_pd3dDevice = nullptr;
 static D3DPRESENT_PARAMETERS g_d3dpp      = {};
 static HWND                  g_hWnd       = nullptr;
+static HWND                  g_door_overlay_hwnd = nullptr;
+static HWND                  g_growtopia_hwnd = nullptr;
+static ULONGLONG             g_next_game_window_scan = 0;
 static const int             g_hdrH       = 24;   
 
 
@@ -141,6 +153,356 @@ static std::string StripGTColorCodes(const std::string& in) {
 
 void AppendLog(const std::string& line);
 static void ShowPlayersDialog();
+
+static LRESULT CALLBACK DoorOverlayWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+    return DefWindowProc(hwnd, msg, wparam, lparam);
+}
+
+static BOOL CALLBACK FindGrowtopiaWindow(HWND hwnd, LPARAM result) {
+    if (!IsWindowVisible(hwnd) || hwnd == g_hWnd || hwnd == g_door_overlay_hwnd) return TRUE;
+    char title[256]{};
+    GetWindowTextA(hwnd, title, static_cast<int>(sizeof(title)));
+    if (std::strstr(title, "Growtopia") != nullptr) {
+        *reinterpret_cast<HWND*>(result) = hwnd;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static void HideDoorOverlay() {
+    if (g_door_overlay_hwnd) ShowWindow(g_door_overlay_hwnd, SW_HIDE);
+}
+
+static void UpdateDoorIdOverlay() {
+    if (!command::DoorIDCommand::is_door_id_reveal_enabled()) {
+        HideDoorOverlay();
+        return;
+    }
+    static ULONGLONG next_update = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (now < next_update) return;
+    next_update = now + 50;
+
+    if (now >= g_next_game_window_scan || !IsWindow(g_growtopia_hwnd)) {
+        g_growtopia_hwnd = nullptr;
+        EnumWindows(FindGrowtopiaWindow, reinterpret_cast<LPARAM>(&g_growtopia_hwnd));
+        g_next_game_window_scan = now + 1500;
+    }
+    if (!g_growtopia_hwnd || IsIconic(g_growtopia_hwnd)) {
+        HideDoorOverlay();
+        return;
+    }
+
+    const HWND foreground = GetForegroundWindow();
+    if (foreground != g_growtopia_hwnd && foreground != g_hWnd) {
+        HideDoorOverlay();
+        return;
+    }
+
+    auto& world_manager = utils::WorldManager::get_instance();
+    const auto world = world_manager.get_world_v2();
+    const auto local = utils::PlayerTracker::get_instance().get_local_player();
+    if (!world.is_valid || world.width == 0 || world.height == 0 || world.tiles.empty() ||
+        local.netID == 0) {
+        HideDoorOverlay();
+        return;
+    }
+
+    RECT client{};
+    if (!GetClientRect(g_growtopia_hwnd, &client)) {
+        HideDoorOverlay();
+        return;
+    }
+    POINT top_left{client.left, client.top};
+    if (!ClientToScreen(g_growtopia_hwnd, &top_left)) {
+        HideDoorOverlay();
+        return;
+    }
+    const int width = client.right - client.left;
+    const int height = client.bottom - client.top;
+    if (width <= 0 || height <= 0 || width > 8192 || height > 8192) {
+        HideDoorOverlay();
+        return;
+    }
+
+    if (!g_door_overlay_hwnd) {
+        static bool registered = false;
+        if (!registered) {
+            WNDCLASSEXA wc{};
+            wc.cbSize = sizeof(wc);
+            wc.lpfnWndProc = DoorOverlayWndProc;
+            wc.hInstance = GetModuleHandleA(nullptr);
+            wc.lpszClassName = "SkriptProxyDoorIdOverlay";
+            RegisterClassExA(&wc);
+            registered = true;
+        }
+        g_door_overlay_hwnd = CreateWindowExA(
+            WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            "SkriptProxyDoorIdOverlay", "", WS_POPUP,
+            top_left.x, top_left.y, width, height,
+            nullptr, nullptr, GetModuleHandleA(nullptr), nullptr);
+        if (!g_door_overlay_hwnd) return;
+    }
+
+    SetWindowPos(g_door_overlay_hwnd, HWND_TOPMOST, top_left.x, top_left.y, width, height,
+                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
+
+    HDC screen_dc = GetDC(nullptr);
+    HDC memory_dc = CreateCompatibleDC(screen_dc);
+    if (!screen_dc || !memory_dc) {
+        if (memory_dc) DeleteDC(memory_dc);
+        if (screen_dc) ReleaseDC(nullptr, screen_dc);
+        HideDoorOverlay();
+        return;
+    }
+
+    BITMAPINFO bitmap_info{};
+    bitmap_info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bitmap_info.bmiHeader.biWidth = width;
+    bitmap_info.bmiHeader.biHeight = -height;
+    bitmap_info.bmiHeader.biPlanes = 1;
+    bitmap_info.bmiHeader.biBitCount = 32;
+    bitmap_info.bmiHeader.biCompression = BI_RGB;
+    void* pixel_data = nullptr;
+    HBITMAP bitmap = CreateDIBSection(screen_dc, &bitmap_info, DIB_RGB_COLORS, &pixel_data, nullptr, 0);
+    if (!bitmap || !pixel_data) {
+        if (bitmap) DeleteObject(bitmap);
+        DeleteDC(memory_dc);
+        ReleaseDC(nullptr, screen_dc);
+        HideDoorOverlay();
+        return;
+    }
+
+    HGDIOBJ old_bitmap = SelectObject(memory_dc, bitmap);
+    std::memset(pixel_data, 0, static_cast<size_t>(width) * height * sizeof(uint32_t));
+    SetBkMode(memory_dc, TRANSPARENT);
+    SetTextColor(memory_dc, RGB(255, 226, 112));
+    HFONT font = CreateFontA(16, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+                             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                             CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
+    HGDIOBJ old_font = font ? SelectObject(memory_dc, font) : nullptr;
+
+    constexpr float tile_px = 32.0f;
+    const float view_tiles_x = static_cast<float>(width) / tile_px;
+    const float view_tiles_y = static_cast<float>(height) / tile_px;
+    const float player_tile_x = local.position.x / tile_px;
+    const float player_tile_y = local.position.y / tile_px;
+    const float camera_x = std::clamp(player_tile_x, view_tiles_x * 0.5f,
+        std::max(view_tiles_x * 0.5f, static_cast<float>(world.width) - view_tiles_x * 0.5f));
+    const float camera_y = std::clamp(player_tile_y, view_tiles_y * 0.5f,
+        std::max(view_tiles_y * 0.5f, static_cast<float>(world.height) - view_tiles_y * 0.5f));
+
+    for (const auto& tile : world.tiles) {
+        if (!(tile.extra_type == 1 || tile.extra_type == 2) || !tile.door_data.has_data()) continue;
+        const std::string& id = tile.door_data.destination;
+        if (id.empty()) continue;
+        const float center_x = width * 0.5f + ((static_cast<float>(tile.x) + 0.5f) - camera_x) * tile_px;
+        const float center_y = height * 0.5f + ((static_cast<float>(tile.y) + 0.5f) - camera_y) * tile_px;
+        SIZE text_size{};
+        if (!GetTextExtentPoint32A(memory_dc, id.c_str(), static_cast<int>(id.size()), &text_size)) continue;
+        const int text_x = static_cast<int>(center_x - text_size.cx * 0.5f);
+        const int text_y = static_cast<int>(center_y - tile_px * 0.5f - text_size.cy - 3.0f);
+        RECT label_rect{text_x - 4, text_y - 2, text_x + text_size.cx + 4, text_y + text_size.cy + 2};
+        HBRUSH label_brush = CreateSolidBrush(RGB(12, 20, 32));
+        FillRect(memory_dc, &label_rect, label_brush);
+        DeleteObject(label_brush);
+        FrameRect(memory_dc, &label_rect, static_cast<HBRUSH>(GetStockObject(GRAY_BRUSH)));
+        TextOutA(memory_dc, text_x, text_y, id.c_str(), static_cast<int>(id.size()));
+    }
+
+    if (old_font) SelectObject(memory_dc, old_font);
+    if (font) DeleteObject(font);
+
+    auto* pixels = static_cast<uint32_t*>(pixel_data);
+    const size_t pixel_count = static_cast<size_t>(width) * height;
+    for (size_t i = 0; i < pixel_count; ++i) {
+        pixels[i] = (pixels[i] & 0x00FFFFFFu) ? (pixels[i] | 0xFF000000u) : 0u;
+    }
+
+    POINT destination{top_left.x, top_left.y};
+    POINT source{0, 0};
+    SIZE overlay_size{width, height};
+    BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+    UpdateLayeredWindow(g_door_overlay_hwnd, screen_dc, &destination, &overlay_size,
+                        memory_dc, &source, 0, &blend, ULW_ALPHA);
+
+    SelectObject(memory_dc, old_bitmap);
+    DeleteObject(bitmap);
+    DeleteDC(memory_dc);
+    ReleaseDC(nullptr, screen_dc);
+}
+
+
+// ---------------------------------------------------------------------------
+// Mouse-aimed autopath
+//
+// Primary interaction (exact, full world range): hold Left Ctrl (configurable)
+// and CLICK a tile. In-range clicks are resolved by the game client itself and
+// arrive as tile packets (exact). Out-of-range clicks are predicted from the
+// calibrated camera: every in-range click reveals the true camera origin (exact
+// tile + mouse position), and predictions extrapolate it by player movement, so
+// clicks anywhere from one end of the world to the other land on the pointed
+// tile. Out-of-range clicks wait 150 ms for the exact packet before falling
+// back to the prediction, so a target the game can report is never approximated.
+//
+// Hover fallback (approximate): with command.autopath.trigger = "hover",
+// pressing the key moves to the predicted tile under the mouse arrow.
+// ---------------------------------------------------------------------------
+
+static std::atomic<std::uint64_t> g_click_seq{ 0 };
+static std::atomic<LONG> g_click_screen_x{ 0 };
+static std::atomic<LONG> g_click_screen_y{ 0 };
+
+static LRESULT CALLBACK AutoPathMouseHook(int code, WPARAM wparam, LPARAM lparam) {
+    if (code == HC_ACTION && wparam == WM_LBUTTONDOWN) {
+        const auto* info = reinterpret_cast<const MSLLHOOKSTRUCT*>(lparam);
+        g_click_screen_x = info->pt.x;
+        g_click_screen_y = info->pt.y;
+        g_click_seq.fetch_add(1, std::memory_order_relaxed);
+    }
+    return CallNextHookEx(nullptr, code, wparam, lparam);
+}
+
+static bool AutoPathEnabled(int& key, std::string& trigger) {
+    auto* core = command::TeleportCommand::get_core();
+    if (!core) return false;
+    key = 162;
+    trigger = "click";
+    try {
+        if (!core->get_config().get<bool>("command.autopath.enabled", true)) return false;
+        key = core->get_config().get<int>("command.autopath.key", 162);
+        trigger = core->get_config().get<std::string>("command.autopath.trigger", std::string("click"));
+    } catch (...) {}
+    return key > 0;
+}
+
+// Mouse (client px) -> world tile. Camera source: the measured calibration
+// extrapolated by player movement when available, else the door overlay's
+// clamped-player model.
+static bool AutoPathMouseToTile(const POINT& mouse_client, int& tile_x, int& tile_y) {
+    auto& world_manager = utils::WorldManager::get_instance();
+    if (!world_manager.has_world()) return false;
+    const uint32_t world_w = world_manager.get_world_width();
+    const uint32_t world_h = world_manager.get_world_height();
+    if (world_w == 0 || world_h == 0) return false;
+
+    const auto local = utils::PlayerTracker::get_instance().get_local_player();
+    if (local.netID == 0) return false;
+
+    RECT client{};
+    if (!GetClientRect(g_growtopia_hwnd, &client)) return false;
+    const int width = client.right - client.left;
+    const int height = client.bottom - client.top;
+    if (width <= 0 || height <= 0 || width > 8192 || height > 8192) return false;
+
+    constexpr float tile_px = 32.0f;
+    const float view_tiles_x = static_cast<float>(width) / tile_px;
+    const float view_tiles_y = static_cast<float>(height) / tile_px;
+    const float player_tile_x = local.position.x / tile_px;
+    const float player_tile_y = local.position.y / tile_px;
+
+    double camera_x = 0.0;
+    double camera_y = 0.0;
+    if (!command::TeleportCommand::estimate_camera(camera_x, camera_y)) {
+        camera_x = std::clamp(player_tile_x, view_tiles_x * 0.5f,
+            std::max(view_tiles_x * 0.5f, static_cast<float>(world_w) - view_tiles_x * 0.5f));
+        camera_y = std::clamp(player_tile_y, view_tiles_y * 0.5f,
+            std::max(view_tiles_y * 0.5f, static_cast<float>(world_h) - view_tiles_y * 0.5f));
+    }
+
+    const float tile_fx = static_cast<float>(camera_x) - 0.5f
+        + (static_cast<float>(mouse_client.x) - width * 0.5f) / tile_px;
+    const float tile_fy = static_cast<float>(camera_y) - 0.5f
+        + (static_cast<float>(mouse_client.y) - height * 0.5f) / tile_px;
+    tile_x = static_cast<int>(std::floor(tile_fx));
+    tile_y = static_cast<int>(std::floor(tile_fy));
+    return tile_x >= 0 && tile_y >= 0 &&
+           tile_x < static_cast<int>(world_w) && tile_y < static_cast<int>(world_h);
+}
+
+// Per-frame consumer for globally captured left clicks: when the autopath key is
+// held and the click lands on the Growtopia window, move to the clicked tile.
+static void ConsumeAutoPathClicks() {
+    static std::uint64_t last_seq = 0;
+    const std::uint64_t seq = g_click_seq.load(std::memory_order_relaxed);
+    if (seq == last_seq) return;
+    last_seq = seq;
+
+    int key = 0;
+    std::string trigger;
+    if (!AutoPathEnabled(key, trigger) || trigger != "click") return;
+    if ((GetAsyncKeyState(key) & 0x8000) == 0) return;
+
+    // Same gating as the door overlay.
+    const ULONGLONG now = GetTickCount64();
+    if (now >= g_next_game_window_scan || !IsWindow(g_growtopia_hwnd)) {
+        g_growtopia_hwnd = nullptr;
+        EnumWindows(FindGrowtopiaWindow, reinterpret_cast<LPARAM>(&g_growtopia_hwnd));
+        g_next_game_window_scan = now + 1500;
+    }
+    if (!g_growtopia_hwnd || IsIconic(g_growtopia_hwnd)) return;
+    const HWND foreground = GetForegroundWindow();
+    if (foreground != g_growtopia_hwnd && foreground != g_hWnd) return;
+
+    POINT mouse{ g_click_screen_x.load(), g_click_screen_y.load() };
+    if (!ScreenToClient(g_growtopia_hwnd, &mouse)) return;
+
+    int tile_x = 0;
+    int tile_y = 0;
+    if (!AutoPathMouseToTile(mouse, tile_x, tile_y)) return;
+
+    // Give the game client ~150 ms to report this click exactly (it does for
+    // tiles within punch range). If its action already started, skip the
+    // prediction; otherwise act on the calibrated estimate.
+    const ULONGLONG click_ms = now;
+    const auto tx = static_cast<uint32_t>(tile_x);
+    const auto ty = static_cast<uint32_t>(tile_y);
+    std::thread([tx, ty, click_ms]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        if (command::TeleportCommand::last_autopath_action_ms() >= click_ms) return;
+        command::TeleportCommand::run_autopath_action(tx, ty);
+    }).detach();
+}
+
+static void UpdateAutoPathKeybind() {
+    static bool prev_down = false;
+
+    int key = 0;
+    std::string trigger;
+    if (!AutoPathEnabled(key, trigger) || trigger != "hover") {
+        prev_down = false;
+        return;
+    }
+
+    // Edge-triggered: fire once per physical press, wherever the key is held.
+    const bool down = (GetAsyncKeyState(key) & 0x8000) != 0;
+    const bool pressed = down && !prev_down;
+    prev_down = down;
+    if (!pressed) return;
+
+    // Same gating as the door overlay: the Growtopia window must exist and be in
+    // the foreground (or the proxy window is), so typing elsewhere never triggers.
+    const ULONGLONG now = GetTickCount64();
+    if (now >= g_next_game_window_scan || !IsWindow(g_growtopia_hwnd)) {
+        g_growtopia_hwnd = nullptr;
+        EnumWindows(FindGrowtopiaWindow, reinterpret_cast<LPARAM>(&g_growtopia_hwnd));
+        g_next_game_window_scan = now + 1500;
+    }
+    if (!g_growtopia_hwnd || IsIconic(g_growtopia_hwnd)) return;
+    const HWND foreground = GetForegroundWindow();
+    if (foreground != g_growtopia_hwnd && foreground != g_hWnd) return;
+
+    POINT mouse{};
+    if (!GetCursorPos(&mouse) || !ScreenToClient(g_growtopia_hwnd, &mouse)) return;
+    if (mouse.x < 0 || mouse.y < 0) return;
+
+    int tile_x = 0;
+    int tile_y = 0;
+    if (!AutoPathMouseToTile(mouse, tile_x, tile_y)) return;
+
+    command::TeleportCommand::run_autopath_action(
+        static_cast<uint32_t>(tile_x), static_cast<uint32_t>(tile_y));
+}
 
 
 
@@ -800,6 +1162,41 @@ static void TabWorld() {
     ImGui::EndChild();
     ImGui::PopStyleColor();
 
+
+    ImGui::Spacing();
+    bool reveal_door_ids = command::DoorIDCommand::is_door_id_reveal_enabled();
+    if (ImGui::Checkbox("Show Door IDs over Growtopia doors", &reveal_door_ids)) {
+        command::DoorIDCommand::set_door_id_reveal(reveal_door_ids);
+        AppendLog(std::string("[GUI] Door ID labels ") + (reveal_door_ids ? "ENABLED" : "DISABLED"));
+    }
+    if (reveal_door_ids && wm.has_world()) {
+        ImGui::TextDisabled("Labels are drawn over door tiles in the Growtopia window while it is open.");
+    }
+
+    if (auto* gui_core = command::TeleportCommand::get_core()) {
+        bool autopath_enabled = true;
+        int autopath_key = 162;
+        std::string autopath_mode = "auto";
+        std::string autopath_trigger = "click";
+        try {
+            autopath_enabled = gui_core->get_config().get<bool>("command.autopath.enabled", true);
+            autopath_key = gui_core->get_config().get<int>("command.autopath.key", 162);
+            autopath_mode = gui_core->get_config().get<std::string>("command.autopath.mode", std::string("auto"));
+            autopath_trigger = gui_core->get_config().get<std::string>("command.autopath.trigger", std::string("click"));
+        } catch (...) {}
+
+        if (ImGui::Checkbox("Mouse autopath: hold Left Ctrl + click a tile (walk, teleport if blocked)", &autopath_enabled)) {
+            gui_core->get_config().set<bool>("command.autopath.enabled", autopath_enabled);
+            AppendLog(std::string("[GUI] Mouse autopath ") + (autopath_enabled ? "ENABLED" : "DISABLED"));
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("key: 0x%02X, mode: %s, trigger: %s", autopath_key, autopath_mode.c_str(), autopath_trigger.c_str());
+        ImGui::TextDisabled("Works across the whole world: in-range clicks are exact, farther clicks use the self-calibrating camera (click near yourself once to calibrate).");
+        if (autopath_enabled) {
+            ImGui::TextDisabled("While the key is held, your clicks are consumed by autopath (no punching).");
+        }
+    }
+
     
     ImGui::Spacing();
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.04f,0.07f,0.18f,0.90f));
@@ -1452,6 +1849,12 @@ void RunImGuiApp() {
     bool show = true;
     MSG  msg  = {};
 
+    // System-wide left-click capture for the autopath keybind. The hook itself
+    // only stores the cursor position; all filtering happens per-frame in
+    // ConsumeAutoPathClicks. Requires this thread to pump messages, which the
+    // loop below does.
+    HHOOK autopath_mouse_hook = SetWindowsHookExW(WH_MOUSE_LL, AutoPathMouseHook, nullptr, 0);
+
     while (msg.message != WM_QUIT) {
         if (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
             TranslateMessage(&msg);
@@ -1488,6 +1891,9 @@ void RunImGuiApp() {
         }
 
         HRESULT hr = g_pd3dDevice->Present(nullptr, nullptr, nullptr, nullptr);
+        UpdateDoorIdOverlay();
+        UpdateAutoPathKeybind();
+        ConsumeAutoPathClicks();
         if (hr == D3DERR_DEVICELOST &&
             g_pd3dDevice->TestCooperativeLevel() == D3DERR_DEVICENOTRESET)
             ResetDevice();
@@ -1495,9 +1901,18 @@ void RunImGuiApp() {
         if (!show) break;
     }
 
+    if (autopath_mouse_hook) {
+        UnhookWindowsHookEx(autopath_mouse_hook);
+        autopath_mouse_hook = nullptr;
+    }
+
     ImGui_ImplDX9_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
+    if (g_door_overlay_hwnd) {
+        DestroyWindow(g_door_overlay_hwnd);
+        g_door_overlay_hwnd = nullptr;
+    }
     CleanupDeviceD3D();
     DestroyWindow(hwnd);
     UnregisterClass(wc.lpszClassName, wc.hInstance);

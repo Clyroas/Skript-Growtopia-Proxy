@@ -1,8 +1,10 @@
 #pragma once
 #include <string>
 #include <vector>
+#include <unordered_map>
 #include <fstream>
 #include <algorithm>
+#include <limits>
 #include <nlohmann/json.hpp>
 #include <cctype>
 #include <sstream>
@@ -23,7 +25,9 @@ struct ItemInfo {
 
 class ItemDatabase {
 public:
-    ItemDatabase() = default;
+    ItemDatabase() { instance_ = this; }
+    ~ItemDatabase() { if (instance_ == this) instance_ = nullptr; }
+    static ItemDatabase* get_instance() { return instance_; }
     
     bool load_from_json(const std::string& json_path) {
         try {
@@ -35,31 +39,80 @@ public:
             nlohmann::json j;
             file >> j;
             
-            items_.clear();
+            
+            if (!j.contains("items") || !j["items"].is_array()) {
+                return false;
+            }
+            
+            
+            
+            std::vector<ItemInfo> items{};
+            std::unordered_map<int, std::size_t> id_index{};
+            
+            items.reserve(j["items"].size());
+            
+            std::size_t skipped{ 0 };
+            std::size_t duplicate_ids{ 0 };
             
             for (const auto& item_json : j["items"]) {
-                ItemInfo item;
-                item.id = item_json.value("id", -1);
-                item.name = item_json.value("name", "Unknown");
-                item.type = item_json.value("type", 0);
-                item.rarity = item_json.value("rarity", 0);
-                item.file_name = item_json.value("file_name", "");
-                item.clothing_type = item_json.value("clothing_type", 0);
-                item.properties = item_json.value("properties", 0);
-                item.info = item_json.value("_unk10", ""); 
+                if (!item_json.is_object()) {
+                    ++skipped;
+                    continue;
+                }
                 
+                const int id{ read_int(item_json, "id", -1) };
+                if (id < 0) {
+                    ++skipped;
+                    continue;
+                }
+                
+                ItemInfo item;
+                item.id = id;
+                item.name = read_string(item_json, "name", "Unknown");
+                item.type = read_int(item_json, "type", 0);
+                item.rarity = read_int(item_json, "rarity", 0);
+                item.file_name = read_string(item_json, "file_name", "");
+                item.clothing_type = read_int(item_json, "clothing_type", 0);
+                item.properties = read_int(item_json, "properties", 0);
+                item.info = read_string(item_json, "_unk10", "");
                 
                 item.description = build_description(item_json);
                 
-                items_.push_back(item);
+                
+                
+                
+                if (!id_index.emplace(item.id, items.size()).second) {
+                    ++duplicate_ids;
+                    continue;
+                }
+                
+                items.push_back(std::move(item));
             }
             
-            return true;
+            
+            
+            items_ = std::move(items);
+            id_index_ = std::move(id_index);
+            
+            
+            schema_version_ = read_int(j, "version", 0);
+            last_skipped_ = skipped;
+            last_duplicate_ids_ = duplicate_ids;
+            
+            return !items_.empty();
         } catch (const std::exception& e) {
+            
+            
+            load_error_ = e.what();
             return false;
         }
     }
     
+    [[nodiscard]] int schema_version() const { return schema_version_; }
+    [[nodiscard]] std::size_t last_skipped() const { return last_skipped_; }
+    [[nodiscard]] std::size_t last_duplicate_ids() const { return last_duplicate_ids_; }
+    [[nodiscard]] const std::string& load_error() const { return load_error_; }
+
     std::vector<ItemInfo> search_items(const std::string& query, int max_results = 20, const std::string& search_type = "all") const {
         std::vector<ItemInfo> results;
         std::string query_lower = to_lower(query);
@@ -184,10 +237,11 @@ public:
     }
     
     const ItemInfo* get_item_by_id(int id) const {
-        if (id >= 0 && id < items_.size()) {
-            return &items_[id];
+        const auto it{ id_index_.find(id) };
+        if (it == id_index_.end()) {
+            return nullptr;
         }
-        return nullptr;
+        return &items_[it->second];
     }
     
     size_t get_item_count() const {
@@ -195,8 +249,94 @@ public:
     }
 
 private:
+    inline static ItemDatabase* instance_ = nullptr;
     std::vector<ItemInfo> items_;
+    std::unordered_map<int, std::size_t> id_index_;
+    int schema_version_{ 0 };
+    std::size_t last_skipped_{ 0 };
+    std::size_t last_duplicate_ids_{ 0 };
+    std::string load_error_{};
+
     
+    
+    
+    
+    
+    
+    
+    
+    static int read_int(const nlohmann::json& object,
+                        const char* key,
+                        int fallback) noexcept
+    {
+        if (!object.is_object() || !object.contains(key)) {
+            return fallback;
+        }
+
+        const auto& value{ object[key] };
+
+        try {
+            if (value.is_number_integer()) {
+                return value.get<int>();
+            }
+            if (value.is_number_unsigned()) {
+                const auto raw{ value.get<unsigned long long>() };
+                if (raw > static_cast<unsigned long long>(std::numeric_limits<int>::max())) {
+                    return std::numeric_limits<int>::max();
+                }
+                return static_cast<int>(raw);
+            }
+            if (value.is_number_float()) {
+                return static_cast<int>(value.get<double>());
+            }
+            
+            if (value.is_string()) {
+                const std::string text{ value.get<std::string>() };
+                if (!text.empty()) {
+                    return std::stoi(text);
+                }
+            }
+        }
+        catch (const std::exception&) {
+            
+        }
+
+        return fallback;
+    }
+
+    static std::string read_string(const nlohmann::json& object,
+                                   const char* key,
+                                   const std::string& fallback) noexcept
+    {
+        if (!object.is_object() || !object.contains(key)) {
+            return fallback;
+        }
+
+        const auto& value{ object[key] };
+
+        try {
+            if (value.is_string()) {
+                return value.get<std::string>();
+            }
+            
+            
+            if (value.is_number_integer()) {
+                return std::to_string(value.get<long long>());
+            }
+            if (value.is_number_unsigned()) {
+                return std::to_string(value.get<unsigned long long>());
+            }
+            if (value.is_boolean()) {
+                return value.get<bool>() ? "1" : "0";
+            }
+        }
+        catch (const std::exception&) {
+            
+        }
+
+        return fallback;
+    }
+
     static std::string to_lower(const std::string& str) {
         std::string result = str;
         std::transform(result.begin(), result.end(), result.begin(),
@@ -207,7 +347,7 @@ private:
     static std::string build_description(const nlohmann::json& item_json) {
         std::ostringstream desc;
         
-        int type = item_json.value("type", 0);
+        int type = read_int(item_json, "type", 0);
         desc << "Type: ";
         switch (type) {
             case 0: desc << "Block"; break;
@@ -235,10 +375,10 @@ private:
             case 22: desc << "Deadly Block"; break;
             case 23: desc << "Trampoline"; break;
             case 24: desc << "Consumable"; break;
-            default: desc << "Unknown"; break;
+            default: desc << "Type " << type; break;
         }
         
-        desc << " | Rarity: " << item_json.value("rarity", 0);
+        desc << " | Rarity: " << read_int(item_json, "rarity", 0);
         
         
         

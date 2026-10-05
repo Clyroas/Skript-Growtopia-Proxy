@@ -15,7 +15,7 @@
 
 namespace command {
 
-bool DoorIDCommand::s_reveal_enabled = false;
+std::atomic<bool> DoorIDCommand::s_reveal_enabled{false};
 core::Core* DoorIDCommand::s_core = nullptr;
 std::atomic<bool> DoorIDCommand::s_monitor_running = false;
 std::thread DoorIDCommand::s_monitor_thread{};
@@ -26,8 +26,8 @@ std::string DoorIDCommand::s_last_reported_door_id{};
 
 DoorIDCommand::DoorIDCommand() : CommandBase(
     {"doorid"},
-    {},
-    "Toggle door ID reveal - shows door IDs when you enter them",
+    {"[on|off|toggle]"},
+    "Toggle door ID labels in the proxy World map and report nearby IDs",
     0
 ) {}
 
@@ -56,7 +56,14 @@ void DoorIDCommand::execute(client::Client* client, const std::vector<std::strin
     }
 
     
-    toggle_door_id_reveal();
+    if (args.size() > 1 && (args[1] == "on" || args[1] == "off")) {
+        set_door_id_reveal(args[1] == "on");
+    } else if (args.size() > 1 && args[1] != "toggle") {
+        send_console_message("`4Usage: /doorid [on|off|toggle]");
+        return;
+    } else {
+        toggle_door_id_reveal();
+    }
     
     
     std::string message;
@@ -73,7 +80,14 @@ void DoorIDCommand::execute(client::Client* client, const std::vector<std::strin
 }
 
 void DoorIDCommand::toggle_door_id_reveal() {
-    s_reveal_enabled = !s_reveal_enabled;
+    set_door_id_reveal(!s_reveal_enabled);
+}
+
+void DoorIDCommand::set_door_id_reveal(bool enabled) {
+    if (s_reveal_enabled == enabled) return;
+    s_reveal_enabled = enabled;
+    if (enabled) start_monitor();
+    else stop_monitor();
 }
 
 bool DoorIDCommand::is_door_id_reveal_enabled() {

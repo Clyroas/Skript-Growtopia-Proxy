@@ -4,6 +4,8 @@
 #include "world_parser_v2.h"
 #include <mutex>
 #include <vector>
+#include <deque>
+#include <algorithm>
 #include <cstring>
 #include <spdlog/spdlog.h>
 
@@ -35,6 +37,7 @@ public:
         width_ = world.width;
         height_ = world.height;
         world_name_ = world.name;  
+        remember_world_locked(world_name_);
         world_v2_copy_ = world;    
         
         spdlog::info("WorldManager: Storing V2 world data - '{}' {}x{}, {} tiles", 
@@ -86,6 +89,8 @@ public:
         
         width_ = world_info.Width;
         height_ = world_info.Height;
+        world_name_ = world_info.Name ? world_info.Name : "";
+        remember_world_locked(world_name_);
         
         spdlog::info("WorldManager: Storing world data - {}x{}, {} tiles, {} items", 
                      world_info.Width, world_info.Height, 
@@ -130,6 +135,21 @@ public:
         return world_name_;
     }
 
+    std::vector<std::string> get_known_world_names() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return {recent_worlds_.begin(), recent_worlds_.end()};
+    }
+
+    std::vector<world::DroppedItemInfo> get_items_snapshot() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return items_;
+    }
+
+    std::vector<world::DroppedItemInfo> get_live_objects_snapshot() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return live_objects_;
+    }
+
     
     uint32_t get_world_width() const {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -147,8 +167,17 @@ public:
     }
 
     
-    const std::vector<TileData>& get_tiles() const { 
-        return tiles_; 
+    const std::vector<TileData>& get_tiles() const {
+        return tiles_;
+    }
+
+    // Thread-safe copy of the tile grid. The reference getter above is only safe for
+    // callers that already hold the world mutex or run on the network thread; worker
+    // threads (scanpath traversal, FindPath) must use this instead, or iterate a
+    // vector that a concurrent world swap invalidates mid-loop.
+    std::vector<TileData> get_tiles_snapshot() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return tiles_;
     }
     
     
@@ -241,6 +270,15 @@ public:
     }
 
 private:
+    void remember_world_locked(const std::string& name) {
+        if (name.empty()) return;
+        auto existing = std::find(recent_worlds_.begin(), recent_worlds_.end(), name);
+        if (existing != recent_worlds_.end()) recent_worlds_.erase(existing);
+        recent_worlds_.push_front(name);
+        constexpr std::size_t max_recent_worlds = 100;
+        if (recent_worlds_.size() > max_recent_worlds) recent_worlds_.pop_back();
+    }
+
     WorldManager() : has_world_(false), width_(0), height_(0) {}
     ~WorldManager() = default;
     WorldManager(const WorldManager&) = delete;
@@ -250,6 +288,7 @@ private:
     bool has_world_;
     uint32_t width_, height_;
     std::string world_name_;
+    std::deque<std::string> recent_worlds_;
     std::vector<TileData> tiles_;
     std::vector<world::DroppedItemInfo> items_;      
     std::vector<world::DroppedItemInfo> live_objects_; 

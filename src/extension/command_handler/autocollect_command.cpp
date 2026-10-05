@@ -184,8 +184,8 @@ void AutoCollectCommand::run_autocollect(uint64_t generation) {
 
         
         auto& wm = utils::WorldManager::get_instance();
-        std::vector<world::DroppedItemInfo> snap_items = wm.get_items();
-        std::vector<world::DroppedItemInfo> snap_live  = wm.get_live_objects();
+        std::vector<world::DroppedItemInfo> snap_items = wm.get_items_snapshot();
+        std::vector<world::DroppedItemInfo> snap_live  = wm.get_live_objects_snapshot();
 
         
         struct Cand { uint32_t uid; uint16_t id; float x,y,d2; };

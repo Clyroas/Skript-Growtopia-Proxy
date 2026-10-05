@@ -6,6 +6,7 @@
 #include <utility>
 #include <thread>
 #include <chrono>
+#include <mutex>
 #include <spdlog/spdlog.h>
 
 namespace lua {
@@ -17,6 +18,7 @@ using ConsoleMessageCallback = std::function<void(const std::string& msg)>;
 
 class LuaBridge {
     lua_State* L;
+    mutable std::recursive_mutex state_mutex_;
     
     
     static SendPacketCallback s_send_packet_callback;
@@ -77,6 +79,7 @@ public:
     
     
     bool execute(const std::string& code) {
+        std::lock_guard<std::recursive_mutex> lock(state_mutex_);
         if (luaL_dostring(L, code.c_str()) != LUA_OK) {
             spdlog::error("Lua error: {}", lua_tostring(L, -1));
             lua_pop(L, 1);
@@ -87,6 +90,7 @@ public:
 
     
     std::string execute_with_error(const std::string& code) {
+        std::lock_guard<std::recursive_mutex> lock(state_mutex_);
         if (luaL_dostring(L, code.c_str()) != LUA_OK) {
             std::string err = lua_tostring(L, -1);
             lua_pop(L, 1);
@@ -98,6 +102,7 @@ public:
     
     
     bool execute_file(const std::string& filepath) {
+        std::lock_guard<std::recursive_mutex> lock(state_mutex_);
         if (luaL_dofile(L, filepath.c_str()) != LUA_OK) {
             spdlog::error("Lua file error: {}", lua_tostring(L, -1));
             lua_pop(L, 1);
@@ -108,6 +113,7 @@ public:
     
     
     bool call_function(const std::string& func_name) {
+        std::lock_guard<std::recursive_mutex> lock(state_mutex_);
         lua_getglobal(L, func_name.c_str());
         if (!lua_isfunction(L, -1)) {
             spdlog::error("Lua: '{}' is not a function", func_name);
@@ -125,6 +131,7 @@ public:
     
     
     std::string call_function_get_string(const std::string& func_name) {
+        std::lock_guard<std::recursive_mutex> lock(state_mutex_);
         lua_getglobal(L, func_name.c_str());
         if (!lua_isfunction(L, -1)) {
             spdlog::error("Lua: '{}' is not a function", func_name);
@@ -148,6 +155,7 @@ public:
     
     
     lua_State* get_state() { return L; }
+    std::recursive_mutex& state_mutex() { return state_mutex_; }
     
     
     

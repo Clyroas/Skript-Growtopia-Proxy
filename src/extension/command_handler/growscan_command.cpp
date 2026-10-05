@@ -12,7 +12,9 @@
 #include "../../utils/world_manager.hpp"
 #include "../../utils/lua_manager.hpp"
 #include <spdlog/spdlog.h>
+#include <algorithm>
 #include <unordered_map>
+#include <unordered_set>
 #include <sstream>
 
 namespace command {
@@ -63,7 +65,7 @@ void GrowScanCommand::handle_button_click(player::Player* player, const std::str
     if (button == "scan_blocks") {
         spdlog::info("GrowScan: Checking world data availability...");
         spdlog::info("GrowScan: has_world = {}", world_mgr.has_world());
-        spdlog::info("GrowScan: tiles count = {}", world_mgr.get_tiles().size());
+        spdlog::info("GrowScan: tiles count = {}", world_mgr.get_tiles_snapshot().size());
         
         if (!world_mgr.has_world()) {
             utils::PacketUtils::send_chat_message(player, "`4Error: No world data available. Try entering/re-entering a world first.");
@@ -87,7 +89,7 @@ void GrowScanCommand::handle_button_click(player::Player* player, const std::str
     else if (button == "scan_items") {
         spdlog::info("GrowScan: Checking world data availability...");
         spdlog::info("GrowScan: has_world = {}", world_mgr.has_world());
-        spdlog::info("GrowScan: items count = {}", world_mgr.get_items().size());
+        spdlog::info("GrowScan: items count = {}", world_mgr.get_items_snapshot().size());
         
         if (!world_mgr.has_world()) {
             utils::PacketUtils::send_chat_message(player, "`4Error: No world data available. Try entering/re-entering a world first.");
@@ -234,7 +236,7 @@ std::string GrowScanCommand::scan_world_tiles(const world::WorldInfo* world_info
 std::string GrowScanCommand::scan_world_tiles_from_manager() {
     auto& world_mgr = utils::WorldManager::get_instance();
     
-    const std::vector<utils::WorldManager::TileData>& tiles = world_mgr.get_tiles();
+    const std::vector<utils::WorldManager::TileData> tiles = world_mgr.get_tiles_snapshot();
     
     if (tiles.empty()) {
         return "";
@@ -279,7 +281,7 @@ std::string GrowScanCommand::scan_world_tiles_from_manager() {
 std::string GrowScanCommand::scan_floating_objects(const world::WorldInfo* world_info) {
     
     auto& world_mgr = utils::WorldManager::get_instance();
-    const auto& objects = world_mgr.get_items();
+    const auto objects = world_mgr.get_items_snapshot();
     
     if (objects.empty()) {
         spdlog::info("GrowScan: No floating objects in map data");
@@ -310,8 +312,21 @@ std::string GrowScanCommand::scan_floating_objects_from_manager() {
     auto& world_mgr = utils::WorldManager::get_instance();
     
     
-    const std::vector<world::DroppedItemInfo>& items = world_mgr.get_items();
-    const std::vector<world::DroppedItemInfo>& live_objects = world_mgr.get_live_objects();
+    const std::vector<world::DroppedItemInfo> items = world_mgr.get_items_snapshot();
+    std::vector<world::DroppedItemInfo> live_objects = world_mgr.get_live_objects_snapshot();
+
+    // The interceptor copies world items into the live list when they are touched;
+    // those copies keep the world item's uid. Skip them so nothing is counted twice.
+    // (Live drops that arrived as packets get synthetic uids starting at 1'000'000,
+    // so they cannot collide with real world uids.)
+    std::unordered_set<uint32_t> world_uids;
+    world_uids.reserve(items.size() * 2);
+    for (const auto& drop : items) {
+        world_uids.insert(drop.Uid);
+    }
+    live_objects.erase(std::remove_if(live_objects.begin(), live_objects.end(),
+        [&](const world::DroppedItemInfo& drop) { return world_uids.count(drop.Uid) > 0; }),
+        live_objects.end());
     
     spdlog::info("[GrowScan] Scanning items: {} from world parse, {} live objects", items.size(), live_objects.size());
     
