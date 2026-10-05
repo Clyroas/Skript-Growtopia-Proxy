@@ -44,3 +44,8 @@ test_items.exe
 test_items_edge.exe
 /tests/_*.exe
 /tests/_obj_*/
+
+# Secrets: never commit private keys. The proxy's MITM CA key is per-install;
+# generate it on first run instead of tracking it.
+resources/key.pem
+resources/cert.pem
