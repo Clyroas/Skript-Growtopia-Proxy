@@ -19,6 +19,10 @@ class AutoCrimeExtension final : public IExtension {
     core::Core* core_;
     std::string tilex_;
     std::string tiley_;
+    // X14: battle-dialog coords + freshness stamp. A fighting dialog arriving
+    // first (mid-crime enable, reconnect) must not auto-click stale coords.
+    bool have_battle_coords_ = false;
+    std::chrono::steady_clock::time_point battle_coords_time_{};
 
     std::string villain_;
     std::string liq_ = "no";
@@ -37,7 +41,14 @@ class AutoCrimeExtension final : public IExtension {
     int use4_ = 0;
     int use5_ = 0;
     std::vector<int> available_cards_;
-    std::chrono::steady_clock::time_point last_action_time_{};
+    std::chrono::steady_clock::time_point next_allowed_time_{};
+    // X7: throttled replies wait here for the Tick flush instead of sleeping
+    // the relay thread (same send times, no stall, no threads).
+    struct PendingSend {
+        std::chrono::steady_clock::time_point due{};
+        std::string payload;
+    };
+    std::vector<PendingSend> pending_sends_;
     int action_delay_ms_ = 650;
 
     std::string last_setup_key_;
@@ -59,6 +70,10 @@ public:
                 }
                 handle_server_packet(evt);
             }
+        );
+        core_->get_event_dispatcher().appendListener(
+            core::EventType::Tick,
+            [this](const core::EventTick&) { flush_pending_sends(); }
         );
     }
 
@@ -82,7 +97,7 @@ private:
         while ((pos = dialog.find(needle, pos)) != std::string::npos) {
             size_t start = pos + needle.size();
             size_t end = start;
-            while (end < dialog.size() && std::isdigit(static_cast<unsigned char>(dialog[end]))) {
+            while (end < dialog.size() && (end - start) < 9 && std::isdigit(static_cast<unsigned char>(dialog[end]))) { // X23: cap digit run, dialog is server-controlled
                 ++end;
             }
             if (end > start) {
@@ -99,7 +114,7 @@ private:
         if (pos == std::string::npos) return 0;
         size_t start = pos + needle.size();
         size_t end = start;
-        while (end < dialog.size() && std::isdigit(static_cast<unsigned char>(dialog[end]))) {
+        while (end < dialog.size() && (end - start) < 9 && std::isdigit(static_cast<unsigned char>(dialog[end]))) { // X23: cap digit run, dialog is server-controlled
             ++end;
         }
         if (end == start) return 0;
@@ -122,18 +137,25 @@ private:
         return std::clamp(configured, 200, 2500);
     }
 
-    void throttle_action() {
-        auto now = std::chrono::steady_clock::now();
-        const int delay_ms = get_effective_action_delay_ms();
-        if (last_action_time_.time_since_epoch().count() != 0) {
-            const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                now - last_action_time_
-            ).count();
-            if (elapsed_ms < delay_ms) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms - static_cast<int>(elapsed_ms)));
-            }
+    void flush_pending_sends() {
+        if (pending_sends_.empty() || !core_) {
+            return;
         }
-        last_action_time_ = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        for (auto it = pending_sends_.begin(); it != pending_sends_.end(); ) {
+            if (now < it->due) {
+                ++it;
+                continue;
+            }
+            auto* client = core_->get_client();
+            if (client && client->get_player()) {
+                ByteStream<std::uint16_t> bs{};
+                bs.write(packet::NET_MESSAGE_GENERIC_TEXT);
+                bs.write(it->payload, false);
+                client->get_player()->send_packet(bs.get_data(), 0);
+            }
+            it = pending_sends_.erase(it);
+        }
     }
 
     static std::string extract_embed(const std::string& dialog, const std::string& key) {
@@ -156,13 +178,13 @@ private:
 
     void send_text_overlay(const std::string& msg) {
         if (!core_) return;
-        player::Player* target = nullptr;
-        if (auto* server = core_->get_server(); server && server->get_player()) {
-            target = server->get_player();
-        } else if (core_->get_client() && core_->get_client()->get_player()) {
-            target = core_->get_client()->get_player();
+        // X14: overlays render on the game client only. The old fallback retargeted
+        // to the upstream player - junk CALL_FUNCTION packets to the real server.
+        auto* server = core_->get_server();
+        if (!server || !server->get_player()) {
+            return;
         }
-        if (!target) return;
+        player::Player* target = server->get_player();
 
         packet::Variant var{};
         var.add("OnTextOverlay");
@@ -186,11 +208,20 @@ private:
         if (!core_ || !core_->get_client() || !core_->get_client()->get_player()) {
             return;
         }
-        throttle_action();
-        ByteStream<std::uint16_t> bs{};
-        bs.write(packet::NET_MESSAGE_GENERIC_TEXT);
-        bs.write(payload, false);
-        core_->get_client()->get_player()->send_packet(bs.get_data(), 0);
+        // X7: throttle without sleeping the relay thread - the reply goes out
+        // from the Tick flush at the same throttled time.
+        const int delay_ms = get_effective_action_delay_ms();
+        const auto now = std::chrono::steady_clock::now();
+        auto due = now;
+        if (next_allowed_time_.time_since_epoch().count() != 0 && next_allowed_time_ > now) {
+            due = next_allowed_time_;
+        }
+        next_allowed_time_ = due + std::chrono::milliseconds(delay_ms);
+        if (pending_sends_.size() >= 8) {
+            spdlog::warn("AutoCrime: pending send queue full, dropping oldest");
+            pending_sends_.erase(pending_sends_.begin());
+        }
+        pending_sends_.push_back(PendingSend{due, payload});
     }
 
     void send_open_battle(bool use_title_keys, bool use_battle_button) {
@@ -302,6 +333,9 @@ private:
 
         tilex_ = extract_embed(dialog, "tilex");
         tiley_ = extract_embed(dialog, "tiley");
+        // X14: stamp coord freshness - the fighting dialog validates this.
+        have_battle_coords_ = !tilex_.empty() && !tiley_.empty();
+        battle_coords_time_ = std::chrono::steady_clock::now();
         available_cards_ = extract_available_cards(dialog);
         configure_for_villain(dialog);
 
@@ -377,6 +411,18 @@ private:
     void handle_fighting_dialog(const core::EventPacket& evt, const std::string& dialog) {
         
         if (has(dialog, "embed_data|state|3|") || has(dialog, "You are defeated")) {
+            return;
+        }
+
+        // X14: tilex_/tiley_ come from the battle dialog. A fighting dialog that
+        // arrives first must not auto-click with stale or empty coords - show a
+        // hint and let the dialog open normally instead of canceling it.
+        const auto now = std::chrono::steady_clock::now();
+        const bool coords_stale = !have_battle_coords_ ||
+            battle_coords_time_.time_since_epoch().count() == 0 ||
+            std::chrono::duration_cast<std::chrono::seconds>(now - battle_coords_time_).count() > 120;
+        if (coords_stale) {
+            send_text_overlay("`4AutoCrime: `oopen the crime battle first, then fight.");
             return;
         }
 

@@ -50,47 +50,23 @@ private:
         
         
         if (game_packet.type == packet::PACKET_SEND_INVENTORY_STATE) {
-            spdlog::info(">>> PACKET_SEND_INVENTORY_STATE received! Size: {}", ext_data.size());
+            spdlog::debug("PACKET_SEND_INVENTORY_STATE received, size: {}", ext_data.size());
             handle_inventory_state(ext_data);
             return;
         }
-        
-        
-        if (game_packet.type == packet::PACKET_ITEM_CHANGE_OBJECT) {
-            spdlog::info(">>> PACKET_ITEM_CHANGE_OBJECT received! Size: {}", ext_data.size());
 
-            
-            
-            
-            
-            if (ext_data.empty()) {
-                auto& world_mgr = utils::WorldManager::get_instance();
-                const auto& items = world_mgr.get_items();
-                const auto& live = world_mgr.get_live_objects();
-                
-                for (const auto& item : items) {
-                    bool found = false;
-                    for (const auto& lo : live) {
-                        if (lo.Uid == item.Uid) { found = true; break; }
-                    }
-                    if (!found) {
-                        world_mgr.add_live_object(item);
-                        spdlog::info("Converted world item UID {} -> live object", item.Uid);
-                        command::AutoCollectCommand::notify_item_drop(item.X, item.Y);
-                        break;
-                    }
-                }
-            }
-        }
-        
-        
-        if (ext_data.size() >= sizeof(packet::TankUpdatePacket)) {
-            const packet::TankUpdatePacket* tank = 
-                reinterpret_cast<const packet::TankUpdatePacket*>(ext_data.data());
-            
+        // X2: for these packets the tank is carried HEADER-INLINE (bytes 4..60),
+        // exactly as client.cpp parses it and as the state tracker reads STATE.
+        // The old code cast ext_data as the tank (garbage whenever ext happened to
+        // be >= 56 bytes) and, when ext was empty, "converted" the first unmatched
+        // world item - misattributing every drop. Both paths are gone.
+        if (game_packet.type == packet::PACKET_ITEM_CHANGE_OBJECT ||
+            game_packet.type == packet::PACKET_MODIFY_ITEM_INVENTORY ||
+            game_packet.type == packet::PACKET_TILE_CHANGE_REQUEST) {
+            const auto* tank = reinterpret_cast<const packet::TankUpdatePacket*>(&game_packet);
             switch (game_packet.type) {
                 case packet::PACKET_ITEM_CHANGE_OBJECT:
-                    spdlog::info(">>> Handling: net_id={}, int_data={}, float_var={}", 
+                    spdlog::debug("ITEM_CHANGE_OBJECT: net_id={}, int_data={}, float_var={}",
                                 tank->net_id, tank->int_data, tank->float_var);
                     handle_item_change_object(tank);
                     break;
@@ -104,13 +80,13 @@ private:
                     break;
             }
         }
-    }
+    }    }
 
     void handle_item_change_object(const packet::TankUpdatePacket* tank) {
         auto& world_mgr = utils::WorldManager::get_instance();
         
         
-        spdlog::info("[ITEM-CHANGE] net_id={}, target={}, flags=0x{:X}, float_var={}, int_data={}, x2={}, y2={}, pos=({:.1f},{:.1f})", 
+        spdlog::debug("[ITEM-CHANGE] net_id={}, target={}, flags=0x{:X}, float_var={}, int_data={}, x2={}, y2={}, pos=({:.1f},{:.1f})", 
                     tank->net_id, tank->target_net_id, tank->flags, tank->float_var, tank->int_data,
                     tank->vec_x2, tank->vec_y2, tank->vec_x, tank->vec_y);
         
@@ -123,15 +99,23 @@ private:
             item.Amount = static_cast<uint32_t>(tank->float_var);
             item.Flag = static_cast<uint32_t>(tank->flags);
             
-            // Synthetic uids live in a high range so they can never collide with a real
-            // world object's uid - collisions made /pickup and GrowScan treat different
-            // items as the same one.
-            static uint32_t uid_counter = 1000000;
-            item.Uid = uid_counter++;
+            // X2: allocate from one max+1 sequence scanned over BOTH stores instead of
+            // the old 1000000+ synthetic range. Collect packets reference the object's
+            // uid, so both stores must share one uid space or collects can never
+            // match a recorded drop (the old scheme leaked a stale live object per
+            // pickup and showed ghost duplicates).
+            uint32_t new_uid = 1;
+            {
+                const auto& live = world_mgr.get_live_objects();
+                const auto& items = world_mgr.get_items();
+                for (const auto& it : live)  if (it.Uid >= new_uid) new_uid = it.Uid + 1;
+                for (const auto& it : items) if (it.Uid >= new_uid) new_uid = it.Uid + 1;
+            }
+            item.Uid = new_uid;
             
             world_mgr.add_live_object(item);
-            spdlog::info("✓ Live object spawned: {} x{} at ({:.1f}, {:.1f})", 
-                        item.ItemId, item.Amount, item.X, item.Y);
+            spdlog::info("✓ Live object spawned: {} x{} at ({:.1f}, {:.1f}) [uid {}]", 
+                        item.ItemId, item.Amount, item.X, item.Y, item.Uid);
             
             command::AutoCollectCommand::notify_item_drop(item.X, item.Y);
         }
@@ -144,7 +128,7 @@ private:
         }
         
         else if (tank->is_item_update()) {
-            spdlog::info("✓ Live object count updated");
+            spdlog::debug("Live object count updated");
         }
         else {
             spdlog::warn("[ITEM-CHANGE] Unknown net_id pattern - not drop/collect/update");

@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <thread>
 #include <utility>
 
 #include "web_server.hpp"
@@ -22,8 +23,15 @@ class WebServerExtension final : public IWebServerExtension {
     core::Core* core_;
     httplib::SSLServer server_;
 
+    // X4: written by the HTTPS route thread, consumed by the relay thread Connection
+    // listener. The old unsynchronised read+clear vs write was a data race on a
+    // std::string. Always touch under upstream_mutex_.
     std::string address_;
     uint16_t port_;
+    mutable std::mutex upstream_mutex_;
+    // X20: the HTTPS loop thread. Joined in free() - never detached (a detached
+    // thread could still run route handlers using this after delete).
+    std::thread server_thread_;
 
     std::string declared_version_;
     std::string declared_protocol_;
@@ -54,24 +62,34 @@ public:
                     return;
                 }
 
-                
-                if (evt.get_player().get_peer()->address.host != 16777343) {
-                    spdlog::info("Security alert: External connection attempt blocked");
-                    evt.canceled = true;
-                    return;
+                // X6: no loopback check here - Server::on_connect already drops
+                // non-loopback peers before dispatch, so this listener only ever
+                // sees 127.0.0.1. NOTE: setting evt.canceled on a Connection event
+                // has no effect (server.cpp intentionally ignores it); the old
+                // cancels here were dead code. Do not reject from this listener.
+
+                // X4: consume the pending upstream under the mutex (see members).
+                std::string address;
+                uint16_t port = 65535;
+                {
+                    std::lock_guard<std::mutex> lock(upstream_mutex_);
+                    if (address_.empty() || port_ == 65535) {
+                        return;
+                    }
+                    address = address_;
+                    port = port_;
+                    address_.clear();
+                    port_ = 65535;
                 }
 
-                if (address_.empty() || port_ == 65535) {
-                    return;
+                // X6: a failed upstream connect used to be silently ignored and the
+                // client session hung with no upstream. Nothing to recover with
+                // here, but at least it is loud now.
+                if (core_->get_client()->connect(address, port) == nullptr) {
+                    spdlog::error("Upstream connect failed; client session has no upstream");
                 }
-
-                std::ignore = core_->get_client()->connect(address_, port_);
-                evt.canceled = true;
-
-                address_.clear();
-                port_ = 65535;
             }
-        );
+        )
 
         
         check_ca_certificate();
@@ -124,16 +142,22 @@ public:
         });
 
         if (!server_.bind_to_port("127.0.0.1", 443)) {
-            spdlog::info("HTTPS server failed to bind to port 443");
+            spdlog::error("HTTPS server failed to bind to port 443 - the server_data proxy chain is dead");
             return;
         }
 
         spdlog::trace("HTTPS server initialized on port 443");
-        std::thread{ &WebServerExtension::listen_internal, this }.detach();
+        server_thread_ = std::thread{ &WebServerExtension::listen_internal, this };
     }
 
     void free() override
     {
+        // X20: stop the HTTPS loop and JOIN the listener thread before delete this
+        // (route lambdas capture this; the old .detach() was a shutdown UAF).
+        server_.stop();
+        if (server_thread_.joinable()) {
+            server_thread_.join();
+        }
         delete this;
     }
 
@@ -454,8 +478,11 @@ private:
                     return true;
                 }
 
-                address_ = server_data.get("server");
-                port_ = static_cast<uint16_t>(*upstream_port);
+                {
+                    std::lock_guard<std::mutex> lock(upstream_mutex_);
+                    address_ = server_data.get("server");
+                    port_ = static_cast<uint16_t>(*upstream_port);
+                }
 
                 
                 
@@ -485,9 +512,16 @@ private:
                 res.set_content(server_data.serialize(), "text/html");
 
                 const auto [version, protocol] = client_declaration();
+                std::string logged_address;
+                uint16_t logged_port = 0;
+                {
+                    std::lock_guard<std::mutex> lock(upstream_mutex_);
+                    logged_address = address_;
+                    logged_port = port_;
+                }
                 spdlog::info("Proxied server_data.php -> {}:{} (client version {}, protocol {})",
-                    address_,
-                    port_,
+                    logged_address,
+                    logged_port,
                     version.empty() ? "unknown" : version,
                     protocol.empty() ? "unknown" : protocol);
                 return true;

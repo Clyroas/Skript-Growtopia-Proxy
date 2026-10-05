@@ -9,7 +9,8 @@ public:
     
     virtual ~IPlayerStateTrackerExtension() = default;
     
-    void free() override {}
+    // X23: was an empty free() - the only one of 15 extensions that leaked itself.
+    void free() override { delete this; }
 };
 
 } 

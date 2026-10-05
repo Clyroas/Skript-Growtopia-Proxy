@@ -45,12 +45,19 @@ public:
                     return;
                 }
 
-                std::ignore = core_->get_client()->connect(address_, port_);
+                // X6: a failed upstream connect used to be silently ignored and the
+                // client session hung with no upstream. Nothing to recover with
+                // here, but at least it is loud now.
+                if (core_->get_client()->connect(address_, port_) == nullptr) {
+                    spdlog::error("SubServerSwitch: upstream connect failed; client session has no upstream");
+                }
 
                 address_.clear();
                 port_ = -1;
 
-                evt.canceled = true;
+                // X6: the old cancel here was dead code - server.cpp intentionally
+                // ignores Connection.canceled. This flow never depended on it; the
+                // redirect above is the whole effect.
             }
         );
 
@@ -116,6 +123,8 @@ public:
                     packet.uuid_token = tokenize.at(2);
                 }
 
+                // X21: index 5 is optional (older servers send 5 args); missing -> 0.
+                // get_any_int() is OOB-safe (nullopt), so no size>=6 check is needed.
                 packet.login_mode = static_cast<uint8_t>(evt_variant.get_any_int(5).value_or(0));
 
                 packet::PacketHelper::send(packet, evt.get_target());

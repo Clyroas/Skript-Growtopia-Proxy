@@ -13,6 +13,7 @@
 #include <thread>
 #include <chrono>
 #include <regex>
+#include <vector>
 #include <algorithm>
 
 namespace extension::autosurg {
@@ -23,7 +24,15 @@ class AutoSurgExtension final : public IExtension {
     std::string last_tilex_;
     std::string last_tiley_;
     std::string last_dialog_content_;  
-    std::chrono::steady_clock::time_point last_tool_click_time_{};
+    std::chrono::steady_clock::time_point next_tool_time_{};
+    // X7: throttled tool clicks wait here for the Tick flush instead of sleeping
+    // the relay thread (same send times, no stall, no threads).
+    struct PendingTool {
+        std::chrono::steady_clock::time_point due{};
+        std::string tool;
+        std::string overlay;
+    };
+    std::vector<PendingTool> pending_tools_;
     std::string last_tool_sent_;
     int tool_click_delay_ms_ = 700;
 
@@ -48,6 +57,10 @@ public:
         );
         
         spdlog::trace("AutoSurgExtension initialized");
+        core_->get_event_dispatcher().appendListener(
+            core::EventType::Tick,
+            [this](const core::EventTick&) { flush_pending_tools(); }
+        );
     }
 
     void free() override {
@@ -451,46 +464,61 @@ private:
         
         evt.canceled = true;
 
-        auto now = std::chrono::steady_clock::now();
+        // X7: throttle without sleeping the relay thread - the click goes out
+        // from the Tick flush at the same throttled time.
         const int effective_delay_ms = get_effective_tool_delay_ms();
-        if (last_tool_click_time_.time_since_epoch().count() != 0) {
-            const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                now - last_tool_click_time_
-            ).count();
-
-            if (elapsed_ms < effective_delay_ms) {
-                const auto wait_ms = effective_delay_ms - static_cast<int>(elapsed_ms);
-                spdlog::debug("AutoSurg: Throttling tool clicks, waiting {}ms", wait_ms);
-                std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
-            }
+        const auto now = std::chrono::steady_clock::now();
+        auto due = now;
+        if (next_tool_time_.time_since_epoch().count() != 0 && next_tool_time_ > now) {
+            due = next_tool_time_;
+            spdlog::debug("AutoSurg: Throttling tool clicks, deferred by {}ms",
+                          std::chrono::duration_cast<std::chrono::milliseconds>(due - now).count());
         }
-
-        spdlog::debug("AutoSurg: Sending click for tool{}", tool);
-        
-        
-        std::ostringstream packet_str;
-        packet_str << "action|dialog_return\n"
-                   << "dialog_name|surgery\n"
-                   << "buttonClicked|tool" << tool;
-        
-        std::string packet_data = packet_str.str();
-        spdlog::debug("AutoSurg: Tool packet data:\n{}", packet_data);
-        
-        
-        ByteStream<std::uint16_t> byte_stream{};
-        byte_stream.write(packet::NET_MESSAGE_GENERIC_TEXT);
-        byte_stream.write(packet_data, false);
-        
-        core_->get_client()->get_player()->send_packet(byte_stream.get_data(), 0);
-        last_tool_click_time_ = std::chrono::steady_clock::now();
-        last_tool_sent_ = tool;
+        next_tool_time_ = due + std::chrono::milliseconds(effective_delay_ms);
 
         const std::string id = base_tool_id(tool);
-        const std::string tool_name = tool_name_from_id(id);
-        const std::string purpose = tool_purpose_from_id(id, last_dialog_content_);
-        send_text_overlay(fmt::format("Using {} - {}", tool_name, purpose));
-        
-        spdlog::debug("AutoSurg: Tool click sent and dialog canceled!");
+        PendingTool item;
+        item.due = due;
+        item.tool = tool;
+        item.overlay = fmt::format("Using {} - {}", tool_name_from_id(id),
+                                   tool_purpose_from_id(id, last_dialog_content_));
+        if (pending_tools_.size() >= 8) {
+            spdlog::warn("AutoSurg: pending tool queue full, dropping oldest");
+            pending_tools_.erase(pending_tools_.begin());
+        }
+        pending_tools_.push_back(std::move(item));
+        spdlog::debug("AutoSurg: Tool click queued and dialog canceled!");
+    }
+
+    void flush_pending_tools() {
+        if (pending_tools_.empty() || !core_) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        for (auto it = pending_tools_.begin(); it != pending_tools_.end(); ) {
+            if (now < it->due) {
+                ++it;
+                continue;
+            }
+            auto* client = core_->get_client();
+            if (client && client->get_player()) {
+                spdlog::debug("AutoSurg: Sending click for tool{}", it->tool);
+                std::ostringstream packet_str;
+                packet_str << "action|dialog_return\n"
+                           << "dialog_name|surgery\n"
+                           << "buttonClicked|tool" << it->tool;
+                const std::string packet_data = packet_str.str();
+                spdlog::debug("AutoSurg: Tool packet data:\n{}", packet_data);
+                ByteStream<std::uint16_t> byte_stream{};
+                byte_stream.write(packet::NET_MESSAGE_GENERIC_TEXT);
+                byte_stream.write(packet_data, false);
+                client->get_player()->send_packet(byte_stream.get_data(), 0);
+                last_tool_sent_ = it->tool;
+                send_text_overlay(it->overlay);
+                spdlog::debug("AutoSurg: Tool click sent!");
+            }
+            it = pending_tools_.erase(it);
+        }
     }
 
     void handle_server_packet(const core::EventPacket& evt) {
@@ -634,9 +662,13 @@ private:
                 byte_stream.write(packet::NET_MESSAGE_GENERIC_TEXT);
                 byte_stream.write(packet_data, false);
                 
-                core_->get_client()->get_player()->send_packet(byte_stream.get_data(), 0);
-                
-                spdlog::debug("AutoSurg: Sent surgery confirmation!");
+                // Drive-by: the surgery path null-checks the client; the confirm path did not.
+                if (core_->get_client() && core_->get_client()->get_player()) {
+                    core_->get_client()->get_player()->send_packet(byte_stream.get_data(), 0);
+                    spdlog::debug("AutoSurg: Sent surgery confirmation!");
+                } else {
+                    spdlog::error("AutoSurg: No client player for surgery confirmation");
+                }
                 evt.canceled = true;
                 return;
             }

@@ -7,7 +7,6 @@
 #include "../../utils/inventory_manager.hpp"
 #include "../../packet/packet_variant.hpp"
 #include "../command_handler/vendsafe_command.hpp"
-#include "../command_handler/vendfast_command.hpp"
 #include <spdlog/spdlog.h>
 #include <sstream>
 #include <string>
@@ -15,6 +14,7 @@
 #include <cctype>
 #include <optional>
 #include <regex>
+#include <chrono>
 
 namespace extension::vendsafe {
 
@@ -26,6 +26,10 @@ class VendSafeExtension final : public IExtension {
     std::string last_expectitem_;
     std::string last_expectprice_;
     int last_buycount_ = 1;
+    // X3: when the pending buy request was sent - a confirm that arrives after
+    // kConfirmTimeout (or is for a different vending) must NOT be auto-confirmed.
+    std::chrono::steady_clock::time_point last_request_time_{};
+    static constexpr std::chrono::seconds kConfirmTimeout{ 15 };
 
 public:
     PROVIDE_EXT_UID(0x56534146); 
@@ -52,7 +56,11 @@ private:
         
         
         
-        return command::VendSafeCommand::is_enabled() || command::VendFastCommand::is_buy_mode_enabled();
+        // X3: vendsafe acts only when IT is enabled. The old
+        // "|| VendFastCommand::is_buy_mode_enabled()" clause never took effect
+        // (vending_fast inits first and cancels Buy dialogs before we see them),
+        // except for arming stale-coord TalkBubble retries - which was a bug.
+        return command::VendSafeCommand::is_enabled();
     }
 
     static std::string extract_value(const std::string& src, const std::string& key) {
@@ -193,15 +201,15 @@ private:
         return safe_items * 10;
     }
 
-    void send_dialog_return(const std::string& payload) {
-        if (!core_ || !core_->get_client() || !core_->get_client()->get_player()) return;
+    bool send_dialog_return(const std::string& payload) {
+        if (!core_ || !core_->get_client() || !core_->get_client()->get_player()) return false;
         ByteStream<std::uint16_t> bs{};
         bs.write(packet::NET_MESSAGE_GENERIC_TEXT);
         bs.write(payload, false);
-        core_->get_client()->get_player()->send_packet(bs.get_data(), 0);
+        return core_->get_client()->get_player()->send_packet(bs.get_data(), 0);
     }
 
-    void send_safe_buy_request(const std::string& tilex, const std::string& tiley,
+    bool send_safe_buy_request(const std::string& tilex, const std::string& tiley,
                                const std::string& expectitem, const std::string& expectprice,
                                int buycount) {
         std::ostringstream packet;
@@ -212,10 +220,10 @@ private:
                << "expectprice|" << expectprice << "|\n"
                << "expectitem|" << expectitem << "|\n"
                << "buycount|" << buycount;
-        send_dialog_return(packet.str());
+        return send_dialog_return(packet.str());
     }
 
-    void send_buy_confirm(const std::string& tilex, const std::string& tiley,
+    bool send_buy_confirm(const std::string& tilex, const std::string& tiley,
                           const std::string& expectitem, const std::string& expectprice,
                           const std::string& buycount) {
         std::ostringstream packet;
@@ -227,7 +235,7 @@ private:
                << "buycount|" << buycount << "|\n"
                << "expectprice|" << expectprice << "|\n"
                << "expectitem|" << expectitem << "|";
-        send_dialog_return(packet.str());
+        return send_dialog_return(packet.str());
     }
 
     void handle_server_packet(const core::EventPacket& evt) {
@@ -267,7 +275,9 @@ private:
             std::string text(txt_len, '\0');
             if (!reader.read_data((std::byte*)text.data(), txt_len)) return;
 
-            if (text.find("can't hold that many locks") != std::string::npos && !last_tilex_.empty()) {
+            const bool pending_fresh = waiting_confirm_ &&
+                (std::chrono::steady_clock::now() - last_request_time_ <= kConfirmTimeout);
+            if (text.find("can't hold that many locks") != std::string::npos && pending_fresh) {
                 send_safe_buy_request(last_tilex_, last_tiley_, last_expectitem_, last_expectprice_, encode_buycount_x10(1));
                 if (core_ && core_->get_server() && core_->get_server()->get_player()) {
                     utils::PacketUtils::send_chat_message(core_->get_server()->get_player(),
@@ -310,19 +320,43 @@ private:
             last_expectitem_ = expectitem;
             last_expectprice_ = expectprice;
             last_buycount_ = safe_buy_encoded;
-            waiting_confirm_ = true;
 
-            send_safe_buy_request(tilex, tiley, expectitem, expectprice, safe_buy_encoded);
-            evt.canceled = true;
+            // X3: only arm the pending-confirm state (and swallow the dialog) when
+            // the request actually went out; otherwise leave the dialog for the user.
+            if (send_safe_buy_request(tilex, tiley, expectitem, expectprice, safe_buy_encoded)) {
+                waiting_confirm_ = true;
+                last_request_time_ = std::chrono::steady_clock::now();
+                evt.canceled = true;
+            } else {
+                spdlog::warn("VendSafe: buy request not sent - dialog left for manual handling");
+            }
             return;
         }
 
         if (dialog.find("end_dialog|vending|Cancel|OK|") != std::string::npos && waiting_confirm_) {
+            // X3: the pending request expires, and a confirm for a DIFFERENT vending
+            // must never be auto-confirmed with stale coords. Either way the dialog
+            // is left for the user (no cancel) instead of buying the wrong item.
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last_request_time_ > kConfirmTimeout) {
+                spdlog::warn("VendSafe: dropping stale pending buy ({}s old) - confirm left for manual handling",
+                             std::chrono::duration_cast<std::chrono::seconds>(now - last_request_time_).count());
+                waiting_confirm_ = false;
+                return;
+            }
+
             std::string tilex = extract_value(dialog, "embed_data|tilex|");
             std::string tiley = extract_value(dialog, "embed_data|tiley|");
             std::string expectitem = extract_value(dialog, "embed_data|expectitem|");
             std::string buycount = extract_value(dialog, "embed_data|buycount|");
             std::string expectprice = extract_price(dialog);
+
+            if ((!tilex.empty() && tilex != last_tilex_) || (!tiley.empty() && tiley != last_tiley_)) {
+                spdlog::warn("VendSafe: confirm is for vending ({}, {}), pending buy is for ({}, {}) - leaving for manual handling",
+                             tilex, tiley, last_tilex_, last_tiley_);
+                waiting_confirm_ = false;
+                return;
+            }
 
             if (tilex.empty()) tilex = last_tilex_;
             if (tiley.empty()) tiley = last_tiley_;
@@ -331,8 +365,11 @@ private:
             if (buycount.empty()) buycount = std::to_string(last_buycount_);
 
             if (!tilex.empty() && !tiley.empty() && !expectitem.empty() && !expectprice.empty()) {
-                send_buy_confirm(tilex, tiley, expectitem, expectprice, buycount);
-                evt.canceled = true;
+                if (send_buy_confirm(tilex, tiley, expectitem, expectprice, buycount)) {
+                    evt.canceled = true;
+                } else {
+                    spdlog::warn("VendSafe: confirm not sent - dialog left for manual handling");
+                }
             }
             waiting_confirm_ = false;
             return;

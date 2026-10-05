@@ -568,57 +568,11 @@ void Client::handle_game_packet(ByteStream<std::uint16_t>& byte_stream, player::
         
         
         
-        if (game_update_packet.type == packet::PACKET_ITEM_CHANGE_OBJECT) {
-            const auto& raw = byte_stream.get_data();
-            if (raw.size() >= 4 + 32) {
-                const uint8_t* b = reinterpret_cast<const uint8_t*>(raw.data()) + 4;
-                uint8_t  obj_type      = b[1];
-                uint8_t  jump_count    = b[2];
-                uint32_t pkt_net_id    = 0;
-                float    float_var     = 0.f;
-                uint32_t pkt_value     = 0;
-                float    vec_x         = 0.f;
-                float    vec_y         = 0.f;
-                memcpy(&pkt_net_id, b + 4,  4);
-                memcpy(&float_var,  b + 16, 4);
-                memcpy(&pkt_value,  b + 20, 4);
-                memcpy(&vec_x,      b + 24, 4);
-                memcpy(&vec_y,      b + 28, 4);
+        // X2: runtime drop/collect tracking is owned solely by the
+        // packet_interceptor extension now (header-inline tank parse). The
+        // inline copy here recorded every drop a second time with a
+        // different uid, so collects could never match recorded drops.
 
-                auto& wm = utils::WorldManager::get_instance();
-
-                if (pkt_net_id == 0xFFFFFFFF) {
-                    
-                    
-                    uint32_t new_uid = 1;
-                    {
-                        const auto& live  = wm.get_live_objects();
-                        const auto& items = wm.get_items();
-                        for (const auto& it : live)  if (it.Uid >= new_uid) new_uid = it.Uid + 1;
-                        for (const auto& it : items) if (it.Uid >= new_uid) new_uid = it.Uid + 1;
-                    }
-                    world::DroppedItemInfo di{};
-                    di.ItemId = static_cast<uint16_t>(pkt_value);
-                    di.X      = std::ceil(vec_x);
-                    di.Y      = std::ceil(vec_y);
-                    di.Amount = static_cast<uint32_t>(static_cast<uint8_t>(float_var));
-                    di.Flag   = obj_type;
-                    di.Uid    = new_uid;
-                    wm.add_dropped_item(di);
-                    spdlog::info("[ITEM_DROP] id={} uid={} x={:.0f} y={:.0f} count={}",
-                                 di.ItemId, di.Uid, di.X, di.Y, di.Amount);
-
-                } else if (pkt_net_id == 0xFFFFFFFC) {
-                    
-
-                } else if (pkt_net_id > 0) {
-                    
-                    wm.remove_dropped_item_by_uid(pkt_value);
-                    wm.remove_live_object(pkt_value);
-                    spdlog::info("[ITEM_COLLECT] uid={} by net_id={}", pkt_value, pkt_net_id);
-                }
-            }
-        }
 
         
         if (game_update_packet.type == packet::PACKET_CALL_FUNCTION && !ext_data.empty()) {

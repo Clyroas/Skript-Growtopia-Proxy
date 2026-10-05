@@ -166,7 +166,8 @@ private:
                 std::string raw = ev.get_message().get_raw();
                 bool canceled = false;
                 lua_invoke_callbacks(L, "OnPacket", [&]() -> int {
-                    lua_pushinteger(L, 2); lua_pushstring(L, raw.c_str()); return 2;
+                    // X19: lua_pushlstring - raw message bytes may contain NULs, which lua_pushstring would truncate at.
+                    lua_pushinteger(L, 2); lua_pushlstring(L, raw.data(), raw.size()); return 2;
                 }, &canceled);
                 if (canceled) const_cast<core::EventMessage&>(ev).canceled = true;
             })});

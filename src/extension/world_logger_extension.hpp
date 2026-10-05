@@ -16,6 +16,7 @@
 #include "command_handler/vendloc_command.hpp"
 #include <fstream>
 #include <chrono>
+#include <memory>
 
 namespace extension::world_logger {
 
@@ -167,15 +168,27 @@ private:
             
             if (!ext_data.empty()) {
                 
-                static world_v2::World g_parsed_world;
+                // X10: each MAP_DATA parses into a fresh heap object that is never
+                // mutated after publication. The previous generation stays alive until
+                // the NEXT publish, so readers holding the old pointer (AdminCommand /
+                // DatCommand via set_current_world) always see a complete, immutable
+                // snapshot - never torn or freed memory. set_current_world_v2() and
+                // save_world_vendings() copy synchronously at publish time.
+                // Residual: the stored raw pointer itself is published without an
+                // atomic; readers run on the relay thread (chat commands), so this is
+                // safe today. If admin/dat ever run off-thread, promote the setters
+                // to shared_ptr<const World>.
+                static std::unique_ptr<world_v2::World> g_published;
+                static std::unique_ptr<world_v2::World> g_retired;
+                auto fresh = std::make_unique<world_v2::World>();
                 
-                if (g_parsed_world.parse((const uint8_t*)ext_data.data(), ext_data.size())) {
+                if (fresh->parse((const uint8_t*)ext_data.data(), ext_data.size())) {
                     
                     // had_warnings also fires for benign recovery heuristics (byte
                     // resyncs, count clamps). Only surface the overlay when tiles were
                     // actually lost, so ordinary worlds don't nag the user.
-                    if (g_parsed_world.tiles_filled_as_empty > 0 ||
-                        g_parsed_world.tiles.size() < g_parsed_world.tile_count) {
+                    if (fresh->tiles_filled_as_empty > 0 ||
+                        fresh->tiles.size() < fresh->tile_count) {
                         send_text_overlay("`4World parse warning; some tiles could not be read");
                     }
 
@@ -185,7 +198,7 @@ private:
                     bool chest_enabled = core_->get_config().get<bool>("command.chest_enabled");
                     if (chest_enabled) {
                         int replaced = 0;
-                        for (auto& tile : g_parsed_world.tiles) {
+                        for (auto& tile : fresh->tiles) {
                             if (tile.fg == 596) {  
                                 tile.fg = 598;      
                                 replaced++;
@@ -197,31 +210,28 @@ private:
                     }
                     
                     spdlog::info("✓ Parsed: {} ({}x{}, {} tiles, {} dropped items)", 
-                                g_parsed_world.name, g_parsed_world.width, g_parsed_world.height, 
-                                g_parsed_world.tiles.size(), g_parsed_world.dropped_items.size());
+                                fresh->name, fresh->width, fresh->height, 
+                                fresh->tiles.size(), fresh->dropped_items.size());
                     
                     
-                    utils::WorldManager::get_instance().set_current_world_v2(g_parsed_world);
-                    
-                    
-                    command::AdminCommand::set_current_world(&g_parsed_world);
-                    
-                    
-                    command::DatCommand::set_current_world(&g_parsed_world);
-                    
-                    
-                    command::FindCommand::save_world_vendings(g_parsed_world);
-                    command::VendLocCommand::save_world_vendings(g_parsed_world);
+                    utils::WorldManager::get_instance().set_current_world_v2(*fresh);
+                    // Retire-then-publish: readers holding the old pointer keep a valid snapshot.
+                    g_retired = std::move(g_published);
+                    g_published = std::move(fresh);
+                    command::AdminCommand::set_current_world(g_published.get());
+                    command::DatCommand::set_current_world(g_published.get());
+                    command::FindCommand::save_world_vendings(*g_published);
+                    command::VendLocCommand::save_world_vendings(*g_published);
                     
                     
                     utils::WorldManager::get_instance().clear_live_objects();
                     
-                    update_player_world_mapping(player_id, g_parsed_world.name.c_str());
-                    logger_.log_world_entry(player_id, 0, g_parsed_world.name.c_str());
+                    update_player_world_mapping(player_id, g_published->name.c_str());
+                    logger_.log_world_entry(player_id, 0, g_published->name.c_str());
                 } else {
                     
                     send_text_overlay("`4World parse failed; GrowScan may be unreliable");
-                    spdlog::error("✗ Parse failed: {}", g_parsed_world.error_message);
+                    spdlog::error("✗ Parse failed: {}", fresh->error_message);
                 }
             }
         } catch (const std::exception& e) {
@@ -229,10 +239,7 @@ private:
         }
     }
 
-    void handle_item_change_object(const core::EventPacket& event) {
-        
-        
-    }
+    // X10: handle_item_change_object stub deleted (never called).
 
     void handle_function_call(const core::EventPacket& event) {
         try {
@@ -262,7 +269,6 @@ private:
                     
                     if (message.find("Collected") != std::string::npos) {
                         spdlog::info("[DROP DETECTED] {}", message);
-                        parse_collected_message(message);
                     }
                 } catch (...) {
                     
@@ -273,39 +279,7 @@ private:
         }
     }
     
-    void parse_collected_message(const std::string& message) {
-        
-        
-        
-        size_t collected_pos = message.find("Collected `w");
-        if (collected_pos == std::string::npos) return;
-        
-        size_t start = collected_pos + 12; 
-        size_t end = message.find("``", start);
-        if (end == std::string::npos) return;
-        
-        std::string item_text = message.substr(start, end - start);
-        
-        
-        size_t first_space = item_text.find(' ');
-        if (first_space == std::string::npos) return;
-        
-        std::string count_str = item_text.substr(0, first_space);
-        std::string item_name = item_text.substr(first_space + 1);
-        
-        int count = 0;
-        try {
-            count = std::stoi(count_str);
-        } catch (...) {
-            return;
-        }
-        
-        spdlog::info("Parsed drop: {} x '{}'", count, item_name);
-        
-        
-        
-        
-    }
+    // X10: parse_collected_message deleted - it parsed count+item, logged, and dropped the result.
 
     void update_player_world_mapping(uint32_t player_id, const char* world_name) {
         for (size_t i = 0; i < player_world_count_; ++i) {
